@@ -10,6 +10,8 @@ README 之外的实测记录。都是真跑出来的结论，不是推测 ——
 
 - 会话列表：`ui inspect session_list -a Weixin -d 3`
   子项 `session_item_<联系人>`，`name` = 联系人 + 最后一条预览 + 时间
+  - 这条同时是**只读监测「没打开的那些会话」**的入口：不点、不切会话就能拿到它的最新一条
+    预览（`collector/wx_collector.py` 的 `session_list_rows`，落库带 `src=session_list`）
 - 聊天消息：`ui inspect chat_message_list -a Weixin -d 12 --json`
   - `mmui::ChatTextItemView` → 真消息，`name` 是正文
   - `mmui::ChatItemView` → 时间分隔条，`name` 形如 `昨天 08:36`

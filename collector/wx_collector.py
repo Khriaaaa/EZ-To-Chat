@@ -489,6 +489,108 @@ def fingerprint(session, text, occ):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+_TIME_HINT_PATTERNS = (
+    r"\d{1,2}:\d{2}",
+    r"(昨天|前天|星期[一二三四五六日天])\s*\d{1,2}:\d{2}",
+    r"(昨天|前天|星期[一二三四五六日天])",
+    r"\d{4}年\d{1,2}月\d{1,2}日(\s*(上午|下午|凌晨|晚上)\s*\d{1,2}:\d{2})?",
+    r"\d{1,2}月\d{1,2}日(\s*\d{1,2}:\d{2})?",
+    r"(上午|下午|凌晨|晚上|中午)\s*\d{1,2}:\d{2}",
+)
+
+
+def _hhmm_like(s):
+    """整串就是个时间提示吗：12:34 / 昨天 20:23 / 星期三 / 2026年10月12日 上午10:00
+
+    必须**整串**匹配。早先写成关键词包含判断，正文「明天下午有空吗」里的「下午」
+    就被当成时间提示吃掉了，预览错成时间 —— 宁可漏认时间，也不能吃正文。
+    """
+    s = (s or "").strip()
+    if not s:
+        return False
+    return any(re.fullmatch(p, s) for p in _TIME_HINT_PATTERNS)
+
+
+def parse_session_list(sessions):
+    """会话列表 -> [{'session','preview','time_hint','selected'}]（纯只读）
+
+    结构见 docs/notes.md：子项 selector/automationId 是 session_item_<联系人>，
+    name 是「联系人\\n最后一条预览\\n时间」多行拼起来的。
+    预览行不写死行号：跳过像时间的行、跳过与联系人同名的行，剩下最长的当预览。
+    行数形状变了也不会崩，最坏是取不到预览（那就这一轮不算）。
+    """
+    out = []
+    try:
+        lst = sessions["windows"][0]["elements"][0]["children"]
+    except (KeyError, IndexError, TypeError):
+        return out
+    for c in lst or []:
+        if not isinstance(c, dict):
+            continue
+        sel = c.get("selector") or c.get("automationId") or ""
+        name = c.get("name") or ""
+        contact = sel[len("session_item_"):] if sel.startswith("session_item_") \
+            else (name.split("\n")[0] or "")
+        contact = contact.strip()
+        if not contact:
+            continue
+        time_hint, cand = "", []
+        for line in (l.strip() for l in name.split("\n")):
+            if not line or line == contact:
+                continue
+            if not time_hint and _hhmm_like(line):
+                time_hint = line
+                continue
+            cand.append(line)
+        out.append({"session": contact,
+                    "preview": max(cand, key=len) if cand else "",
+                    "time_hint": time_hint,
+                    "selected": bool(c.get("isSelected"))})
+    return out
+
+
+def session_list_rows(sessions, open_session, rows, seen, now=None):
+    """会话列表旁路：把「没打开的那些会话」的最新一条也记进库。
+
+    —— 只读界面树，不点击、不切换会话。这是「实时监测全部会话」里风险最低的做法：
+    不读微信进程内存、不注入、不发包，跟现有采集走的完全是同一条路。
+    保守三条：
+      1) 预览为空、或就是当前打开的那个会话（已由聊天窗路径覆盖）-> 不算
+      2) 这段话在该会话库里出现过（不管当时判成谁发的）-> 不算，
+         免得把我刚发出去的那句当成对方新消息
+      3) 指纹（含时间提示）见过 -> 不算
+    行里带 src=session_list，方便区分来源。
+    """
+    now = now or utcnow()
+    out = []
+    for it in parse_session_list(sessions):
+        s, pv = it["session"], it["preview"]
+        if not pv or s == open_session or it["selected"]:
+            continue
+        if any(r.get("text") == pv for r in rows
+               if isinstance(r, dict) and r.get("session") == s):
+            continue
+        fp = hashlib.sha1("\x1f".join(["slist", s, pv, it["time_hint"]]).encode("utf-8")).hexdigest()
+        if fp in seen:
+            continue
+        seen[fp] = (len(rows) + len(out), "them")
+        out.append({"ts_utc": now, "session": s, "sender": "them", "text": pv,
+                    "align_left_px": 0, "align_right_px": 0,
+                    "selector": "session_item_" + s, "time_hint": it["time_hint"],
+                    "fp": fp, "src": "session_list"})
+    return out
+
+
+def append_rows(rows):
+    """追加落盘（原子性靠单行 JSONL + 外部 _StoreLock，和原路径一致）。"""
+    if not rows:
+        return
+    os.makedirs(STORE_DIR, exist_ok=True)
+    with open(MSG_FILE, "a", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
 def quote_senders(items, contact):
     """从引用气泡里推出确定的发送方，返回 {文本: sender}。
 
@@ -745,6 +847,10 @@ def parse_and_store(chat, sessions, shot_p, window, title_obj=None):
 
     with _StoreLock():
         rows, seen = load_store()
+        # 会话列表旁路先跑：即便本轮聊天窗 dump 不可用（掉了登录、窗口被盖住），
+        # 「别的会话来了新消息」照样能被发现 —— 这条旁路存在的意义就在这。
+        sess_rows = session_list_rows(sessions, session, rows, seen)
+        append_rows(sess_rows)
         tail_rows = [(i, r) for i, r in enumerate(rows)
                      if isinstance(r, dict) and r.get("session") == session]
         if not tail_rows and any(isinstance(r, dict) for r in rows):
@@ -755,7 +861,7 @@ def parse_and_store(chat, sessions, shot_p, window, title_obj=None):
                 ot = [(i, r) for i, r in enumerate(rows)
                       if isinstance(r, dict) and r.get("session") == other]
                 if align_window(msg_items, ot)[0] is not None or _shares_run(msg_items, ot):
-                    return session, len(items), []
+                    return session, len(items), sess_rows
         start, mapping = align_window(msg_items, tail_rows)
         legacy = start is None
         if legacy:
@@ -771,7 +877,7 @@ def parse_and_store(chat, sessions, shot_p, window, title_obj=None):
                     cont = True
                     break
             if not cont and not _newer_than_tail(items, msg_items, tail_rows):
-                return session, len(items), []
+                return session, len(items), sess_rows
             start, mapping = 0, {}
 
         qmap = quote_senders(items, session)
@@ -822,11 +928,8 @@ def parse_and_store(chat, sessions, shot_p, window, title_obj=None):
         if fixes:
             apply_sender_fixes(fixes)
         if new_rows:
-            os.makedirs(STORE_DIR, exist_ok=True)
-            with open(MSG_FILE, "a", encoding="utf-8") as f:
-                for r in new_rows:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    return session, len(items), new_rows
+            append_rows(new_rows)
+    return session, len(items), sess_rows + new_rows
 
 
 def safe_shot_name(name):
