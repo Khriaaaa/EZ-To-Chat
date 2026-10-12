@@ -25,18 +25,17 @@ history.db 上下文）→ 面板展示。安装包一条装完（见 §打包�
 
 ## 重构动作
 
-### 1. 采集层收编为本地 Python 轮询
+### 0. 重要修正（2026-10-12 计划评审时发现）
 
-新建 `collector/local_collect.py`（单文件，无外部依赖），把 ps1 的 5 步原样搬成
-`subprocess` 调 `winapp ui list-windows/scroll/inspect/screenshot`。
+`wx_collector.py` 里**已经有单机分支**：`IN_VM = os.name == "nt"`，Windows 直跑时
+`ga_get = shutil.copyfile`、`ga_ps = 本地 powershell`，`start` 走 `Start-Process`
+（判断与微信同会话 → 直接起；跨会话才借 PsExec）。也就是说单机采集不是从零造，
+是把这条已存在但没验收过的路径跑通，再按下面各节补缺口。
 
-- **json 用 `--json` 的 stdout 直读，不再写中转临时文件** —— ps1 当年为保证原子写/绕
-  QGA 文件句柄泄漏做的 `.tmp + Move-Item`、`shot.name` 指针文件、PID 命名的 cmd.out.tmp
-  这些都是跨进程文件搬运的补丁；单机 Python 里 stdout 直读天然原子，这层全部消失。
-- 每轮 still 合成一个快照 dict（rid/utc/hwnd/shot/chat/title/sessions/window/steps），
-  直接喂 `parse_and_store`，不再落 `round.json`。
-- 采集循环保持 2 秒一轮；写库走同一把 `_StoreLock`。
-- 日志/heartbeat 保留（`store/logs/local_collect.log` 轮转，heartbeat 供面板自检）。
+所以提交 1 改成：**真机验收现有 IN_VM 路径**（本地起循环 → poll → 入库 → 自检），
+把验收中暴露的坑补掉；而不是新写 `local_collect.py`。ps1 收不收编进 Python 后置，
+等验收看它够不够用。
+
 
 ### 2. wx_collector.py 瘦身
 
@@ -86,9 +85,16 @@ history.db 上下文）→ 面板展示。安装包一条装完（见 §打包�
 ## 分支/提交计划
 
 预计 3 个提交：
-1. `collector/local_collect.py` 新增（本地采集循环 + 5步搬进 Python）+ `wx_collector.py`
-   解析函数抽出来 import（git mv / refactor，行为不变，老链路标记 deprecated）。
+1. `collector/wx_collector.py` IN_VM 单机真机验收（起循环/native poll/入库/自检）+ 验收中
+   暴露的坑补掉（ps1 收不收编进 Python 视验收结果）。
 2. provider 配置随包落地 + 面板首填引导。
 3. NSIS 打包加 Python runtime + winapp-cli，卸载清理路径校验。
 
-先提交 1（纯新文件+外部 import，风险最小），2、3 顺后。
+先提交 1（验收现有路径，风险最小），2、3 顺后。
+
+## 跨容器/虚机的资产交接（单机后这些全部随包走）
+
+- `store/history.db`（26.7MB 历史库）单机部署时打包进安装包数据目录或首次导入。
+- LLM provider 配置（base_url/key/model）现在在 NAS 的 Hermes config.yaml 里，单机
+  要搬到自己侧的配置或首次启动面板里填。
+
