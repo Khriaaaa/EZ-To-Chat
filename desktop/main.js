@@ -56,7 +56,7 @@ function log() {
 // ---------------------------------------------------------------- 运行环境
 function probePython(cand) {
   try {
-    const r = spawnSync(cand.cmd, cand.args.concat(['-c', 'import sys;sys.exit(0 if sys.version_info>=(3,9) else 1)']),
+    const r = spawnSync(cand.cmd, cand.args.concat(['-c', 'import sys;sys.exit(0 if sys.version_info>=(3,11) else 1)']),
       { timeout: 15000, windowsHide: true });
     return r.status === 0;
   } catch { return false; }
@@ -159,14 +159,24 @@ function setStatus(text) {
 
 // 8801 上残留的监听先清掉：Windows 允许两个 socket 同绑一个端口（SO_REUSEADDR），
 // 旧面板没退干净时请求会随机落到旧的那份上 —— 症状很邪门，比如「刚签出来的票子
-// 被说成过期」。只清我们自己的：python 进程，或可执行文件就在本应用目录下的。
+// 被说成过期」。只清我们自己的，判据只认证据：exe 落在应用目录里，或命令行同时
+// 指向应用目录 + 本应用脚本。不能只看进程名 python/pythonw —— 那会把用户自己的、
+// 恰好监听本端口的 python 服务一起杀掉（审计 F-10）。
 function freePort() {
-  const myDir = path.dirname(process.execPath).toLowerCase().replace(/'/g, "''");
+  // 前缀以 \ 收尾（复核 R2-5）：没有它，wx-reply-assistant-backup\ 里的进程
+  // 会被 wx-reply-assistant\ 的前缀匹配命中而误杀。
+  const myDir = (path.dirname(process.execPath).toLowerCase().replace(/'/g, "''")
+                 .replace(/[\\/]+$/, "") + "\\");
   const ps = [
     `$dir = '${myDir}'`,
     `Get-NetTCPConnection -LocalPort ${PORT} -State Listen -ErrorAction SilentlyContinue | ForEach-Object {`,
     `  $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue`,
-    `  if ($p -and ($p.ProcessName -match '^(python|pythonw)$' -or ($p.Path -and $p.Path.ToLower().StartsWith($dir)))) {`,
+    `  if (-not $p) { return }`,
+    `  $cmd = ''`,
+    `  try { $cmd = (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $p.Id) -ErrorAction SilentlyContinue).CommandLine } catch {}`,
+    `  $mine = ($p.Path -and $p.Path.ToLower().StartsWith($dir)) -or`,
+    `          ($cmd -and $cmd.ToLower().Contains($dir) -and $cmd -match 'assistant\\.py|server\\.py|wx_collector\\.py')`,
+    `  if ($mine) {`,
     `    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue`,
     `    Write-Output ('freed ' + $p.Id + ' ' + $p.ProcessName)`,
     `  }`,
@@ -299,6 +309,17 @@ function createWindow() {
     if (/^https?:/i.test(url) && !/^http:\/\/127\.0\.0\.1/i.test(url)) shell.openExternal(url);
     return { action: 'deny' };
   });
+  // 导航拦截：壳里只许留在本面板。setWindowOpenHandler 只管子窗口，整窗导航
+  // （location.href / 302 / meta refresh）得靠 will-navigate/will-redirect ——
+  // 不然将来任何一处富文本疏漏都能把无地址栏的窗口带去钓鱼页（审计 F-17）。
+  const panelOrigin = 'http://127.0.0.1:' + PORT;
+  const allowNav = (url) => url === panelOrigin || url.startsWith(panelOrigin + '/') || url.startsWith(panelOrigin + '?');
+  win.webContents.on('will-navigate', (e, url) => {
+    if (!allowNav(url)) { e.preventDefault(); log('blocked navigate:', url); }
+  });
+  win.webContents.on('will-redirect', (e, url) => {
+    if (!allowNav(url)) { e.preventDefault(); log('blocked redirect:', url); }
+  });
   win.loadFile(path.join(__dirname, 'loading.html'));
 }
 
@@ -351,7 +372,7 @@ if (!app.requestSingleInstanceLock()) {
         type: 'error', title: '微信回复助手',
         message: '没找到 Python 运行环境',
         detail: '安装包应该自带一份 Python。如果是源码方式跑（npm start），\n' +
-                '请先装好 Python 3.9+ 并勾选 Add to PATH，或用 WXREPLY_PYTHON 指定解释器。',
+                '请先装好 Python 3.11+ 并勾选 Add to PATH，或用 WXREPLY_PYTHON 指定解释器。',
         buttons: ['好'],
       });
       app.exit(1);

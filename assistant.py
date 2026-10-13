@@ -40,6 +40,9 @@ os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 IS_WIN = os.name == "nt"
 PY = sys.executable
 ROOT = Path(__file__).resolve().parent
+# 目录锚定用（复核 R3-4）：注入 powershell 单引号串的小写安装根，带尾分隔符，
+# 避免 D:\wx-reply-assistant-backup 误命中 D:\wx-reply-assistant
+PS_DIR = (str(ROOT).rstrip("\\") + "\\").lower().replace("'", "''")
 STORE = Path(os.environ.get("WXREPLY_STORE", str(ROOT / "store")))
 PIDS = STORE / ".assistant_pids.json"
 COLLECTOR = ROOT / "collector" / "wx_collector.py"
@@ -285,8 +288,20 @@ def cmd_shutdown(a):
         try:
             out = subprocess.run(
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                 "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
-                 "'*wx-reply-assistant*' } | ForEach-Object { \"$($_.ProcessId)|$($_.Name)\" }"],
+                 # 判据收紧（审计 F-10）：光含 'wx-reply-assistant' 子串太宽（编辑器
+                 # 打开项目里的文件都会被算进来）。要求「命令行含应用关键字 + 本应用
+                 # 脚本名」两条同时成立。排除查询自己（$me）和调用它的父进程（$pp =
+                 # 本 assistant.py，复核 F-10）—— 不然会把自己算成待清目标。
+                 # 目录锚定（复核 R3-4）：脚本名匹配仍然不够——编辑器打开项目里的
+                 # generate.py 也会双命中被强杀。再加第三条：命令行必须落在本安装
+                 # 目录（ROOT，小写比较 + 尾 \），判据与 main.js/preflight 同一套。
+                 "$me=$PID; $pp=-1; try { $pp=(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId } catch { }; if (-not $pp) { $pp=-1 }; "
+                 "$dir='%s'; "
+                 "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $me -and $_.ProcessId -ne $pp -and "
+                 "$_.CommandLine -and $_.CommandLine -match 'wx-reply-assistant' -and "
+                 "$_.CommandLine -match 'assistant\\.py|server\\.py|watch\\.py|generate\\.py|wx_collector\\.py|wx_collect\\.ps1' -and "
+                 "$_.CommandLine.ToLower().Contains($dir) } "
+                 "| ForEach-Object { \"$($_.ProcessId)|$($_.Name)\" }" % PS_DIR],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30)
             for line in (out.stdout or "").splitlines():
@@ -311,10 +326,17 @@ def cmd_shutdown(a):
             try:
                 out = subprocess.run(
                     ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                     "$me=$PID; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine "
-                     "-like '*wx-reply-assistant*' -and $_.ProcessId -ne $me -and "
-                     "$_.Name -ne 'powershell.exe' } | "
-                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+                     # 同上的收紧判据（审计 F-10）；powershell.exe 仍整类跳过（防误杀
+                     # 查询自己），采集 PS 的收尾交给安装器的杀进程循环。$pp = 父进程
+                     # （本 assistant.py），不排掉就是自噬（复核 F-10）。
+                     "$me=$PID; $pp=-1; try { $pp=(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $me)).ParentProcessId } catch { }; if (-not $pp) { $pp=-1 }; "
+                     "$dir='%s'; "
+                     "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId "
+                     "-ne $me -and $_.ProcessId -ne $pp -and $_.Name -ne 'powershell.exe' -and $_.CommandLine -and "
+                     "$_.CommandLine -match 'wx-reply-assistant' -and $_.CommandLine -match "
+                     "'assistant\\.py|server\\.py|watch\\.py|generate\\.py|wx_collector\\.py' -and "
+                     "$_.CommandLine.ToLower().Contains($dir) } | "
+                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" % PS_DIR],
                     capture_output=True, timeout=30)
             except Exception:
                 pass

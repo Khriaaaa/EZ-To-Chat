@@ -9,8 +9,10 @@
 ;      -Command "..."（含 \" 变体）在本环境 rc=1 什么都不执行（micro-test tmicro2）。
 ;      独立 .ps1 写进 $TEMP 再 -File 执行是唯一可靠写法（tmicro3 真杀假目标通过）。
 ;   3. 收进程的匹配 = 进程名限定 python/pythonw/powershell/winapp + 命令行含
-;      wx-reply-assistant。新版安装器叫 wx-reply-assistant-setup.exe，不在名单里，
-;      升级时不会被误杀。连续两轮查到 0 才算干净，最多 30 轮（约 35 秒）。
+;      wx-reply-assistant 且含本应用脚本名（assistant.py/server.py/watch.py/
+;      generate.py/wx_collector.py/wx_collect.ps1）—— 只按子串太宽，编辑器打开
+;      项目里的文件都会被误杀（审计 F-10）。新版安装器叫 wx-reply-assistant-setup.exe，
+;      不在名单里，升级时不会被误杀。连续两轮查到 0 才算干净，最多 30 轮（约 35 秒）。
 ;   4. 收完进程先 SetOutPath $TEMP 再 RMDir /r $INSTDIR 补一刀 —— 不换当前目录，
 ;      $INSTDIR 最后一层会因为「是工作目录」删不掉（留个空壳）。
 ;   5. 数据目录（%APPDATA%\wx-reply-assistant：聊天记录、面板密码、模型 Key）：
@@ -29,10 +31,10 @@
   FileWrite $9 "$$ns = @('python.exe','pythonw.exe','powershell.exe','winapp.exe')$\r$\n"
   FileWrite $9 "$$i = 0$\r$\n"
   FileWrite $9 "while($$i -lt 30){$\r$\n"
-  FileWrite $9 "  $$p = @(Get-CimInstance Win32_Process | Where-Object { $$_.ProcessId -ne $$me -and $$ns -contains $$_.Name -and $$_.CommandLine -like '*wx-reply-assistant*' })$\r$\n"
+  FileWrite $9 "  $$p = @(Get-CimInstance Win32_Process | Where-Object { $$_.ProcessId -ne $$me -and $$ns -contains $$_.Name -and $$_.CommandLine -like '*wx-reply-assistant*' -and $$_.CommandLine -match 'assistant\.py|server\.py|watch\.py|generate\.py|wx_collector\.py|wx_collect\.ps1' })$\r$\n"
   FileWrite $9 "  if($$p.Count -eq 0){$\r$\n"
   FileWrite $9 "    Start-Sleep -Milliseconds 1200$\r$\n"
-  FileWrite $9 "    $$p = @(Get-CimInstance Win32_Process | Where-Object { $$_.ProcessId -ne $$me -and $$ns -contains $$_.Name -and $$_.CommandLine -like '*wx-reply-assistant*' })$\r$\n"
+  FileWrite $9 "    $$p = @(Get-CimInstance Win32_Process | Where-Object { $$_.ProcessId -ne $$me -and $$ns -contains $$_.Name -and $$_.CommandLine -like '*wx-reply-assistant*' -and $$_.CommandLine -match 'assistant\.py|server\.py|watch\.py|generate\.py|wx_collector\.py|wx_collect\.ps1' })$\r$\n"
   FileWrite $9 "    if($$p.Count -eq 0){ break }$\r$\n"
   FileWrite $9 "  }$\r$\n"
   FileWrite $9 "  foreach($$q in $$p){ Stop-Process -Id $$q.ProcessId -Force -ErrorAction SilentlyContinue }$\r$\n"

@@ -56,6 +56,16 @@ SUGGESTIONS = STORE / "suggestions.jsonl"
 HEARTBEAT = STORE / "cache" / "heartbeat.txt"
 GENERATE = ROOT / "orchestrator" / "generate.py"
 COLLECTOR = ROOT / "collector" / "wx_collector.py"
+sys.path.insert(0, str(ROOT / "collector"))
+try:
+    import readmode                     # 读取路线开关（ui / db / auto）
+except ImportError:                     # 面板不该因为少了这个文件就起不来
+    readmode = None
+try:
+    from storelock import StoreLock     # 与采集器同一把跨进程 store 锁（见 collector/storelock.py）
+except ImportError as _e:               # 缺文件时面板还能起，但 /api/msg 会明确报错，绝不无锁静默写
+    StoreLock = None
+    _STORE_LOCK_ERR = str(_e)
 CHECK_STATE = STORE / "checker.json"
 CHECK_TIMEOUT = 240          # 一轮自检里「拉起虚机采集 + 搬运」的上限
 # generate 自己管一个总预算（见 orchestrator/generate.py 的 BUDGET_SEC），
@@ -131,8 +141,9 @@ def add_message(session, sender, text, manual=True):
     自检都直接吃。fp 照抄采集器的指纹公式（不含 sender，见 wx_collector
     fingerprint 的注释），再用「手动行」前缀 + 随机盐，保证重发同一句不会
     撞到采集器已入库的同文本行 —— 手动补的上下文本来就该算一条新消息。
-    追加必须持 _gen_lock：生成侧 GenLock 拿的是同一把进程间文件锁，但
-    本进程内 /api/msg 与后台自检的读改写并发只靠线程锁隔开。
+    追加要拿两把锁：_gen_lock（本进程内与后台自检互斥）+ store 跨进程文件锁
+    （与采集器的「读全库 -> 原子重写」互斥 —— 不拿同一把锁，重写会用旧快照
+    把这里刚追加的行整个盖掉，静默丢行）。
     """
     row = {
         "ts_utc": utcnow(),
@@ -144,11 +155,14 @@ def add_message(session, sender, text, manual=True):
             "\x1f".join([session, text, utcnow(), secrets.token_hex(4)])
             .encode("utf-8")).hexdigest()[:20],
     }
+    if StoreLock is None:
+        raise RuntimeError(f"缺 collector/storelock.py，拒绝无锁追加（{_STORE_LOCK_ERR}）")
     MESSAGES.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(row, ensure_ascii=False) + "\n"
     with _gen_lock:
-        with open(MESSAGES, "a", encoding="utf-8") as f:
-            f.write(line)
+        with StoreLock(str(STORE)):
+            with open(MESSAGES, "a", encoding="utf-8") as f:
+                f.write(line)
     return row
 
 
@@ -339,6 +353,32 @@ def check_entry_token(val):
         return False
 
 
+_used_entries = {}          # 进门票 -> 到期时间戳；一次性，用过即作废
+_used_entries_lock = threading.Lock()
+
+
+def consume_entry_token(val):
+    """校验进门票并标记已用 —— 同一张票只放行一次。
+
+    以前只验签名不记状态：180 秒内同一张 URL 反复 GET，每次都换发新 cookie，
+    和「一次性」的自我描述不符（审计 F-13）。
+    """
+    if not check_entry_token(val):
+        return False
+    try:
+        exp = int(val.split(".", 1)[0])
+    except (ValueError, IndexError):
+        return False
+    now = time.time()
+    with _used_entries_lock:
+        for s in [s for s, e in _used_entries.items() if e < now]:
+            _used_entries.pop(s, None)
+        if val in _used_entries:
+            return False
+        _used_entries[val] = exp
+        return True
+
+
 _jsonl_cache = {}       # str(path) -> ((mtime_ns, size), [rows])
 
 
@@ -397,6 +437,25 @@ def safe_check():
     return c
 
 
+def read_mode_state():
+    """/api/state 里的读取路线：当前选的是哪条 + 上一轮实际走的哪条。
+
+    「选的」和「实际走的」分开报：auto 下选的是 auto、走的可能是 db 或 ui，
+    出问题时先说清这一步，再谈数据对不对。
+    """
+    if readmode is None:
+        return {"mode": "ui", "desc": "读取路线开关不可用（缺 collector/readmode.py）",
+                "last": {}, "choices": []}
+    try:
+        mode = readmode.resolve(str(STORE))
+        last = readmode.last_state(str(STORE))
+    except Exception as e:                                   # noqa: BLE001
+        return {"mode": "ui", "desc": "%s: %s" % (type(e).__name__, e),
+                "last": {}, "choices": []}
+    return {"mode": mode, "desc": readmode.DESC.get(mode, ""), "last": last,
+            "choices": list(readmode.MODES)}
+
+
 def state():
     msgs = read_jsonl(MESSAGES)
     recs = read_jsonl(SUGGESTIONS)
@@ -426,6 +485,7 @@ def state():
                              "source_last_fp", "model")} if sug else None,
         "collecting": collecting,
         "fill_enabled": fill_enabled(),
+        "read_mode": read_mode_state(),
         "check": safe_check(),
         "check_enabled": check_enabled(),
         "link_test": link_test_state(),
@@ -727,7 +787,9 @@ class H(BaseHTTPRequestHandler):
     timeout = 30
 
     def log_message(self, fmt, *a):
-        sys.stderr.write("[panel] %s %s\n" % (self.address_string(), fmt % a))
+        # 进门票（?k=）不进日志：panel.log 长期保留，而票 180s 内可换 cookie
+        line = re.sub(r"([?&]k=)[^&\s\"]+", r"\1<masked>", fmt % a)
+        sys.stderr.write("[panel] %s %s\n" % (self.address_string(), line))
 
     def _send(self, code, body=b"", ctype="application/json; charset=utf-8", headers=None):
         if isinstance(body, (dict, list)):
@@ -739,6 +801,17 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # 纵深防御（没有 XSS 注入点也先把围墙砌上）：将来任何一次 innerHTML
+        # 疏漏，缺 CSP 就会直接升级成会话内任意操作。页面现状是内联脚本/样式，
+        # 白名单放行；img 只放本站 + data:（图标是内联 data: SVG）。
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "font-src 'self'; connect-src 'self'; base-uri 'none'; "
+            "form-action 'self'; frame-ancestors 'none'; object-src 'none'")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -764,9 +837,10 @@ class H(BaseHTTPRequestHandler):
         「Failed to fetch」，面板上什么线索都没有。
         """
         import traceback
-        traceback.print_exc()
+        traceback.print_exc()   # 完整堆栈只进服务端日志（panel.log）
         try:
-            self._send(500, {"error": f"面板内部错误：{type(e).__name__}: {e}"})
+            # 不回异常原文：里面可能有路径/实现细节；日志里有完整堆栈
+            self._send(500, {"error": "面板内部错误，详情见服务端日志"})
         except Exception:
             pass
 
@@ -787,10 +861,13 @@ class H(BaseHTTPRequestHandler):
         # ?k=<进门票>：assistant.py 自动开浏览器时带上来，浏览器直接落在面板里。
         # 只认本机来源 —— 开了 --lan 也不能靠这条 URL 绕开密码。
         k = (parse_qs(urlparse(self.path).query).get("k") or [""])[0]
-        if k and self.client_address[0] in ("127.0.0.1", "::1") and check_entry_token(k):
+        if k and self.client_address[0] in ("127.0.0.1", "::1") and consume_entry_token(k):
             ck = (f"{COOKIE}={make_cookie()}; Path=/; HttpOnly; "
                   f"SameSite=Strict; Max-Age={COOKIE_TTL}")
-            return self._send(302, b"", headers={"Location": path or "/", "Set-Cookie": ck})
+            # Location 只允许站内单斜杠路径：path 是从原始请求行切出来的，
+            # "//evil.example/" 这种协议相对地址会把浏览器带去外站
+            dest = path if (path == "/" or re.match(r"^/[^/\\]", path)) else "/"
+            return self._send(302, b"", headers={"Location": dest, "Set-Cookie": ck})
         api = path.startswith("/api/")
         if not self._authed():
             return self._deny(api)
@@ -854,6 +931,8 @@ class H(BaseHTTPRequestHandler):
                 return self._fill()
             if path == "/api/msg":
                 return self._api_msg()
+            if path == "/api/readmode":
+                return self._api_readmode()
             self._send(404, {"error": "not found"})
         except _BodyTooLarge:
             return self._send(413, {"error": "请求体过大（上限 64KB）"})
@@ -867,15 +946,21 @@ class H(BaseHTTPRequestHandler):
         # 计数、判定、写回放在同一临界区：并发失败请求各自读同一个 cnt 再写回
         # cnt+1 会互相覆盖，5 次上限会被绕过。
         with _fails_lock:
-            cnt, t0 = _fails.get(ip, (0, time.time()))
-            if time.time() - t0 > 300:
-                cnt, t0 = 0, time.time()
-            if cnt >= 5:
-                return self._send(429, "尝试过多，请稍后再试", "text/plain; charset=utf-8")
+            now = time.time()
+            # 过期条目顺手清掉：以前只在登录成功时 pop，别的来源 IP 的失败记录会永远留着
+            for k in [k for k, (c, t) in _fails.items() if now - t > 300]:
+                _fails.pop(k, None)
+            cnt, t0 = _fails.get(ip, (0, now))
+            if now - t0 > 300:
+                cnt, t0 = 0, now
+            # 先验密码、后判限速：正确密码永远放行。反过来的话，同一 IP 上攒满
+            # 5 次失败（打错字/别人乱试）后，连机主自己都会被 429 挡在门外。
             if hmac.compare_digest(pw.encode(), PASSWORD.encode()):
                 _fails.pop(ip, None)
                 ck = f"{COOKIE}={make_cookie()}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_TTL}"
                 return self._send(302, b"", headers={"Location": "/", "Set-Cookie": ck})
+            if cnt >= 5:
+                return self._send(429, "尝试过多，请稍后再试", "text/plain; charset=utf-8")
             _fails[ip] = (cnt + 1, t0)
         self._send(401, LOGIN_HTML.replace("%ERR%", '<div class="e">密码错误</div>'), "text/html; charset=utf-8")
 
@@ -927,6 +1012,8 @@ class H(BaseHTTPRequestHandler):
         """
         try:
             req = json.loads(self._body() or b"{}") or {}
+        except _BodyTooLarge:
+            raise           # 超限该回 413（do_POST 统一处理），别吞成「不是合法 JSON」
         except Exception:
             return self._send(400, {"error": "body 不是合法 JSON"})
         if not isinstance(req, dict):
@@ -1027,6 +1114,21 @@ class H(BaseHTTPRequestHandler):
             _fill_lock.release()
         self._send(200, {"ok": True, "index": idx, "seconds": round(dt, 1), "text": text})
 
+    def _api_readmode(self):
+        """切读取路线：{mode: ui|db|auto}。只改 store/collect.yaml 一行。"""
+        if readmode is None:
+            return self._send(503, {"error": "读取路线开关不可用"})
+        try:
+            body = json.loads(self._body().decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._send(400, {"error": "请求体不是合法 JSON"})
+        mode = str(body.get("mode") or "").strip().lower()
+        try:
+            readmode.set_mode(str(STORE), mode)
+        except ValueError as e:
+            return self._send(400, {"error": str(e)})
+        return self._send(200, read_mode_state())
+
     def _api_msg(self):
         """手动补一条上下文消息：谁说的 + 说了什么，直接进 messages.jsonl。
 
@@ -1036,6 +1138,8 @@ class H(BaseHTTPRequestHandler):
         """
         try:
             req = json.loads(self._body() or b"{}") or {}
+        except _BodyTooLarge:
+            raise           # 超限该回 413（do_POST 统一处理），别吞成「不是合法 JSON」
         except Exception:
             return self._send(400, {"error": "body 不是合法 JSON"})
         if not isinstance(req, dict):

@@ -40,6 +40,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STORE_DIR = os.environ.get("WXREPLY_STORE") or os.path.join(os.path.dirname(HERE), "store")
 MSG_FILE = os.path.join(STORE_DIR, "messages.jsonl")
 CACHE_DIR = os.path.join(STORE_DIR, "cache")
+# 读取路线开关（ui / db / auto，见 collector/readmode.py）：同目录直接导入，
+# 面板/测试从别处导入时再加一次 collector 目录，两条导入路径都能用
+sys.path.insert(0, HERE)
+import readmode                                  # noqa: E402
+from storelock import StoreLock                  # noqa: E402  跨进程 store 锁（面板同源）
+try:
+    import wxdb                                   # noqa: E402  本地库直读（只读）
+except ImportError as _e:                         # 缺文件也不该把界面树路线带崩
+    wxdb = None
+    _WXDB_ERR = str(_e)
 # 虚机连接与工作目录都来自 tools/vmcfg.py（环境变量或 config.local.yaml），
 # 代码里不写死主机/口令/UUID。默认用项目自带的 tools/ga.py、tools/ps1run.py。
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
@@ -60,6 +70,13 @@ if IN_VM:
 else:
     GUEST_DIR = "C:\\dl\\wxc"
     GUEST_PS1 = "C:\\dl\\wx_collect.ps1"
+
+
+def _psq(s):
+    """PS 单引号字符串转义：' 变 ''。GUEST_DIR/GUEST_PS1/winapp 路径都可能来自
+    本地配置（WXREPLY_STORE 等），含引号时不转义就是把本地配置变成远端命令
+    注入（审计 F-16）。"""
+    return str(s).replace("'", "''")
 
 # Screenshot geometry (window screenshot 896x648; UIA coords are screen pixels, so
 # screenshot_xy = uia_xy - window origin). Default origin from measurement; overridden
@@ -166,7 +183,7 @@ def _ps_cmd_in_session(ps_args):
         print("collector: 本进程会话 %s / 微信会话 %s，借 PsExec 注入" % (mine, wx))
         return ("Start-Process '%s' -ArgumentList "
                 "'-accepteula','-nobanner','-i','1','-d','powershell.exe',%s"
-                % (psexec, ",".join(ps_args)))
+                % (_psq(psexec), ",".join(ps_args)))
     return ("Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(%s)"
             % ",".join(ps_args))
 
@@ -193,10 +210,10 @@ def push_and_launch(rounds):
         # 不传就会跟老实例共用一个 OutDir，互相抢 heartbeat / collector.lock
         ps_args = ["'-NoProfile'", "'-ExecutionPolicy'", "'Bypass'",
                    "'-WindowStyle'", "'Hidden'",                    # 别在桌面上弹黑窗
-                   "'-File','%s'" % GUEST_PS1, "'-OutDir','%s'" % GUEST_DIR]
+                   "'-File','%s'" % _psq(GUEST_PS1), "'-OutDir','%s'" % _psq(GUEST_DIR)]
         wa = _winapp_path()
         if wa:
-            ps_args.append("'-Winapp','%s'" % wa)
+            ps_args.append("'-Winapp','%s'" % _psq(wa))
         out = ga_ps(_ps_cmd_in_session(ps_args))
         print(out.strip())
         return "exitcode: 0" in out
@@ -211,7 +228,7 @@ def push_and_launch(rounds):
     out = run([sys.executable, GA, "put", gen_path, GUEST_PS1], timeout=240)
     # ga.py put 的收尾阶段偶尔会因为 QGA 的响应不是 JSON 而吐 traceback，
     # 但文件其实已经写完了：所以按虚机上的实际大小校验，不信它的输出文本。
-    size = re.search(r"out-data:\s*(\d+)", ga_ps("(Get-Item '%s').Length" % GUEST_PS1))
+    size = re.search(r"out-data:\s*(\d+)", ga_ps("(Get-Item '%s').Length" % _psq(GUEST_PS1)))
     if not size or int(size.group(1)) != os.path.getsize(gen_path):
         print(out.strip()[-200:])
         return False
@@ -221,14 +238,14 @@ def push_and_launch(rounds):
               # 不传就会跟老实例共用一个 OutDir，互相抢 heartbeat / collector.lock
               "'-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden',"  # 别在桌面上弹黑窗
               "'-File','%s','-OutDir','%s'"
-              % (GUEST_PS1, GUEST_DIR))
+              % (_psq(GUEST_PS1), _psq(GUEST_DIR)))
     out2 = ga_ps(ps)
     print(out2.strip()[-200:])
     return "exitcode: 0" in out2
 
 
 def cmd_start(a):
-    ga_ps("New-Item -ItemType Directory -Force -Path '%s' | Out-Null" % GUEST_DIR)
+    ga_ps("New-Item -ItemType Directory -Force -Path '%s' | Out-Null" % _psq(GUEST_DIR))
     if is_running():
         print("collector already running in guest")
         return 0
@@ -248,7 +265,7 @@ def is_running():
     out = ga_ps("$d='%s'; $r='RUN=none'; if (Test-Path \"$d\\collector.lock\") { "
                 "$p=(Get-Content \"$d\\collector.lock\" -Raw -ErrorAction SilentlyContinue); "
                 "if ($p) { $p=$p.Trim(); if ($p -match '^\\d+$' -and (Get-Process -Id ([int]$p) -ErrorAction SilentlyContinue)) "
-                "{ $r='RUN=' + $p } } }; $r" % GUEST_DIR)
+                "{ $r='RUN=' + $p } } }; $r" % _psq(GUEST_DIR))
     return bool(re.search(r"RUN=(\d+)", out))
 
 
@@ -262,18 +279,22 @@ def cmd_stop(a):
 
 
 def cmd_once(a):
-    ga_ps("New-Item -ItemType Directory -Force -Path '%s' | Out-Null" % GUEST_DIR)
+    mode = readmode.resolve(STORE_DIR)
+    if mode in ("db", "auto") and wxdb is not None:
+        # 本地库直读不经过访客侧，没有"跑一轮"这回事：直接读一次就行
+        return cmd_poll(a)
+    ga_ps("New-Item -ItemType Directory -Force -Path '%s' | Out-Null" % _psq(GUEST_DIR))
     if is_running():
         # 常驻循环在跑时再拉一份，两份会共用 cmd.out.tmp / shot.name，把 dump 拼坏
         print("collector already running in guest; skip once")
         return 0
-    ga_ps("Remove-Item '%s\\heartbeat.txt' -Force -ErrorAction SilentlyContinue" % GUEST_DIR)
+    ga_ps("Remove-Item '%s\\heartbeat.txt' -Force -ErrorAction SilentlyContinue" % _psq(GUEST_DIR))
     if not push_and_launch(1):
         print("launch failed")
         return 1
     deadline = time.time() + a.wait
     while time.time() < deadline:
-        out = ga_ps("if (Test-Path '%s\\heartbeat.txt') { 'HB_OK' } else { 'HB_NO' }" % GUEST_DIR)
+        out = ga_ps("if (Test-Path '%s\\heartbeat.txt') { 'HB_OK' } else { 'HB_NO' }" % _psq(GUEST_DIR))
         if "HB_OK" in out:
             break
         time.sleep(4)
@@ -647,48 +668,19 @@ def load_store():
     return rows, idx
 
 
-class _StoreLock:
-    """跨进程互斥（文件锁）。
+class _StoreLock(StoreLock):
+    """跨进程互斥（文件锁）—— store 读改写段共用。
 
     面板的后台自检（wx_collector check）和 assistant.py up 起的 sync 是两个进程，
     都会走「读整库 -> 判新 -> 追加 / 原地改 sender」。没有这把锁时两边会各追加一份
     同样的行，或者 apply_sender_fixes 的全量重写把对方刚追加的行整个抹掉。
     锁只包住这一小段读改写（毫秒级），不做进程级长期持有。
+    实现收口在 collector/storelock.py —— 面板的 /api/msg 追加拿的是同一把（审计 F-04），
+    谁改锁文件路径/锁定范围，等于同时改两边的锁协议。
     """
 
-    def __enter__(self):
-        self.f = None
-        try:
-            os.makedirs(STORE_DIR, exist_ok=True)
-            self.f = open(os.path.join(STORE_DIR, ".store.lock"), "a+")
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(self.f.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
-        except Exception as e:
-            # 拿不到锁必须让这一轮失败，不能静默降级成「无锁执行」：
-            # 两个 poll 进程同时无锁做「读库 -> 判新 -> 全量重写」会互相抹行，
-            # 而这正是这把锁存在的唯一理由。
-            self.f = None
-            raise RuntimeError(f"拿不到 store 锁：{type(e).__name__}: {e}") from e
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            if self.f is not None:
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(self.f.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
-                self.f.close()
-        except Exception:
-            pass
-        self.f = None
-        return False
+    def __init__(self):
+        super().__init__(STORE_DIR)
 
 
 def _norm(s):
@@ -942,6 +934,72 @@ def safe_shot_name(name):
     return name
 
 
+def poll_db(mode, quiet):
+    """本地库直读那一轮：返回 0/1 = 「这轮已处理完」，None = 「请回落界面树」。
+
+    跟界面树那条路共用同一把 _StoreLock 和同一个 fingerprint 定义 —— 指纹只有
+    一份（在 fingerprint() 里），两条路写出去的行形状必须一模一样，下游才不会串味。
+    """
+    def log(msg):
+        if not quiet:
+            print(msg, flush=True)
+
+    if wxdb is None:
+        readmode.record(STORE_DIR, mode=mode, via="ui",
+                        note="本地库直读模块不可用：%s" % _WXDB_ERR)
+        if mode == "db":
+            log("db 路线不可用：本地库直读模块没装上（%s）" % _WXDB_ERR)
+            return 1
+        return None
+    try:
+        rows, info = wxdb.collect(STORE_DIR, log=log)
+    except wxdb.Unavailable as e:
+        note = "本地库直读不可用：%s" % e
+        readmode.record(STORE_DIR, mode=mode, via="ui", note=note)
+        if mode == "db":
+            log("db 路线走不通：%s" % e)
+            log("回界面树读取：存一份 store/collect.yaml 写 read_mode: ui（或切成 auto）")
+            return 1
+        log("%s，这轮回落界面树读取" % note)
+        return None
+    blank = 0
+    new = []
+    with _StoreLock():
+        old, seen = load_store()
+        cnt = {}
+        for m in rows:
+            text = (m.get("text") or "").strip()
+            if not text:
+                blank += 1
+                continue
+            k = (m["session"], text)
+            occ = cnt.get(k, 0) + 1
+            cnt[k] = occ
+            fp = fingerprint(m["session"], text, occ)
+            if fp in seen:
+                continue
+            seen[fp] = (len(old) + len(new), m["sender"])
+            new.append({"ts_utc": m.get("ts_utc") or utcnow(), "session": m["session"],
+                        "sender": m["sender"], "text": text,
+                        "align_left_px": 0, "align_right_px": 0,
+                        "selector": "db:%s" % (m.get("local_id") or ""),
+                        "time_hint": "", "fp": fp, "src": "db",
+                        "kind": m.get("kind") or "text"})
+        if new:
+            append_rows(new)
+    detail = dict(info)
+    if blank:
+        detail["skipped_blank"] = blank
+    readmode.record(STORE_DIR, mode=mode, via="db", detail=detail)
+    if new:
+        print("db %s  new=%d" % (info.get("account"), len(new)), flush=True)
+    elif not quiet:
+        print("db %s  无新消息（会话 %d，密钥 %d，跳过无正文 %d）"
+              % (info.get("account"), info.get("sessions") or 0,
+                 info.get("keys") or 0, blank))
+    return 0
+
+
 def cmd_poll(a):
     """拉一轮快照并入库。
 
@@ -950,6 +1008,14 @@ def cmd_poll(a):
     拼出来的会是「chat 属于第 N 轮、shot 属于第 N+2 轮」，sender 就是这么判错的。
     """
     quiet = getattr(a, "quiet", False)
+    mode = readmode.resolve(STORE_DIR)
+    if mode in ("db", "auto"):
+        rc = poll_db(mode, quiet)
+        if rc is not None:
+            return rc
+    # 显式 ui 也记「本轮实际走了 ui」（复核 R3-2）：否则从 db 切回 ui 后 state 里的
+    # via 停在 db，cmd_check 会永久误判 running=true、不再拉起访客采集。
+    readmode.record(STORE_DIR, mode=mode, via="ui")
     os.makedirs(CACHE_DIR, exist_ok=True)
     # 本地暂存文件带上本进程 PID：面板自检和 assistant up 的 sync 是两个进程，
     # 会同时各拉一份；共用同一个落点会互相覆盖（ga.py 用的是 .part + replace，
@@ -1049,24 +1115,38 @@ def cmd_check(a):
 
     给面板的后台自检线程用 —— 面板不该依赖外部先把采集起好。
     最后打一行 CHECK_JSON，调用方按它判断「采集在不在跑」。
+
+    走本地库直读时不需要访客侧那个采集循环：面板每次自检就是一次读取，
+    所以那条路下 running 直接算真，也不会去拉起访客脚本。
     """
+    rc = cmd_poll(a)
+    st = readmode.last_state(STORE_DIR)
+    via = st.get("via") or ""
+    if via == "db":
+        print('CHECK_JSON={"running": true, "started": false, "rc": %d, '
+              '"mode": "%s", "via": "db"}' % (rc, st.get("mode") or "db"), flush=True)
+        return rc
     running = is_running()
     started = False
     if not running:
         started = push_and_launch(0)          # 0 = 常驻循环
-        if not started and not a.quiet:
-            print("check: 拉起虚机采集失败")
-    rc = cmd_poll(a)
-    running = running or started
-    print('CHECK_JSON={"running": %s, "started": %s, "rc": %d}'
-          % ("true" if running else "false", "true" if started else "false", rc), flush=True)
+        if not started:
+            if not a.quiet:
+                print("check: 拉起虚机采集失败")   # 静默也绝不进 else 白拉一轮（复核 R3-5）
+        else:
+            rc = cmd_poll(a)                  # 刚拉起来的采集，再搬一次
+    print('CHECK_JSON={"running": %s, "started": %s, "rc": %d, "mode": "%s", '
+          '"via": "%s"}' % ("true" if (running or started) else "false",
+                            "true" if started else "false", rc,
+                            st.get("mode") or readmode.resolve(STORE_DIR),
+                            via or "ui"), flush=True)
     return rc
 
 
 def cmd_status(a):
     out = ga_ps("$d='%s'; if (Test-Path \"$d\\heartbeat.txt\") { 'HB=' + (Get-Content \"$d\\heartbeat.txt\" -Raw).Trim() } "
                 "else { 'HB=none' }; if (Test-Path \"$d\\collector.log\") { Get-Content \"$d\\collector.log\" -Tail %d } "
-                "else { 'LOG=none' }" % (GUEST_DIR, a.tail))
+                "else { 'LOG=none' }" % (_psq(GUEST_DIR), a.tail))
     m = re.search(r"HB=(\S+)", out)
     hb = m.group(1) if m else "unknown"
     age = ""
@@ -1075,6 +1155,14 @@ def cmd_status(a):
         age = " (%ds ago)" % (datetime.now(timezone.utc) - t).total_seconds()
     except ValueError:
         pass
+    st = readmode.last_state(STORE_DIR)
+    mode = readmode.resolve(STORE_DIR)
+    print("读取路线:", mode, "|", readmode.DESC.get(mode, ""))
+    if st:
+        print("上一轮实际走:", st.get("via") or "?", "at", st.get("at") or "?",
+              ("｜" + st["note"]) if st.get("note") else "")
+        if st.get("detail"):
+            print("  明细:", json.dumps(st["detail"], ensure_ascii=False))
     print("heartbeat:", hb + age)
     print("log tail:")
     body = out.split("out-data:", 1)[-1]
@@ -1106,7 +1194,31 @@ def main():
     p.add_argument("--quiet", action="store_true", help="只在有新消息时输出")
     p = sub.add_parser("status", help="heartbeat, log tail, stored count")
     p.add_argument("--tail", type=int, default=5)
+    p = sub.add_parser("mode", help="看/改读取路线：mode [ui|db|auto]")
+    p.add_argument("value", nargs="?", help="不填=只看当前值")
+    sub.add_parser("dbcheck", help="本地库直读自检：环境/账号/密钥/会话，逐项说清卡在哪")
     a = ap.parse_args()
+    if a.cmd == "mode":
+        if a.value:
+            try:
+                print("读取路线已设为", readmode.set_mode(STORE_DIR, a.value))
+            except ValueError as e:
+                print("参数不对：%s" % e)
+                return 1
+        cur = readmode.resolve(STORE_DIR)
+        print("当前读取路线:", cur, "|", readmode.DESC.get(cur, ""))
+        st = readmode.last_state(STORE_DIR)
+        if st:
+            print("上一轮实际走:", st.get("via") or "?", "at", st.get("at") or "?",
+                  ("｜" + st["note"]) if st.get("note") else "")
+        return 0
+    if a.cmd == "dbcheck":
+        if wxdb is None:
+            print("本地库直读模块不可用：%s" % _WXDB_ERR)
+            return 1
+        os.environ.setdefault("WXREPLY_STORE", STORE_DIR)
+        print(json.dumps(wxdb.dbcheck(), ensure_ascii=False, indent=2))
+        return 0
     sys.exit({"start": cmd_start, "stop": cmd_stop, "poll": cmd_poll, "sync": cmd_sync,
               "once": cmd_once, "check": cmd_check, "status": cmd_status}[a.cmd](a))
 

@@ -344,7 +344,7 @@ button.mini{padding:9px 14px;font-size:12.5px;white-space:nowrap}
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
-let session=null,busy=false,lastTs=null,lastKey=null;
+let session=null,busy=false,lastTs=null,lastKey=null,lastState=null;
 /* 内联 SVG 图标（代替原来的 ✓ / ✗ 字符）；用 innerHTML 拼装，文本走 textContent 以免被转义 */
 const ICO={
   ok:'<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6.1"/><path d="M5.3 8.2 7.2 10.1 10.8 6"/></svg>',
@@ -410,10 +410,29 @@ function checkText(s){
   const ago=sec<60?sec+'s前':Math.round(sec/60)+'m前';
   return (c.last_result==='error'?'自检出错 ':'自检 ')+ago;
 }
+/* 读取路线 chip：点一下换一条（界面树 → 本地库 → 自动）。
+   「选的那条」和「上一轮实际走的那条」都写在 tooltip 里 —— auto 下这两个可能不一样，
+   出问题时先看这一步。空面板（还没有生成）时也要显示，因为那时最需要它。 */
+function readModeChip(s){
+  const rm=(s&&s.read_mode)||{},name={ui:'界面树',db:'本地库',auto:'自动'};
+  const sel=name[rm.mode]||rm.mode||'?',via=name[(rm.last||{}).via]||'';
+  const c=el('span','chip testable',via&&via!==sel?('读取 '+sel+' · 上轮 '+via):('读取 '+sel));
+  c.title=('当前：'+(rm.desc||sel))
+          +((rm.last||{}).note?('｜上轮：'+rm.last.note):'')
+          +((rm.last||{}).at?('（'+rm.last.at+'）'):'')+'｜点击切换';
+  c.onclick=()=>cycleReadMode(c);
+  return c;
+}
 function renderCard(s){
   const p=$('panel');p.textContent='';
   const meta=s.suggestion_meta;
   if(!s.suggestions.length){
+    /* 空着的时候才是「读不到消息」最需要排查的时候：把采集状态和读取路线
+       摆在上面，别逼用户去别的页面找。 */
+    const bar=el('div','strip');
+    bar.appendChild(el('span','chip'+(s.collecting?' on':''),s.collecting?'采集中':'采集未运行'));
+    bar.appendChild(readModeChip(s));
+    p.appendChild(bar);
     const e=el('div','empty','还没有生成');const b=el('button','pri','生成');b.style.marginTop='10px';
     b.onclick=generate;e.appendChild(el('br'));e.appendChild(b);p.appendChild(e);return;
   }
@@ -432,6 +451,7 @@ function renderCard(s){
   strip.appendChild(el('span','nm',nm));
   strip.appendChild(el('span','chip'+(s.collecting?' on':''),s.collecting?'采集中':'采集未运行'));
   strip.appendChild(el('span','chip'+(s.check_enabled?' on':''),checkText(s)));
+  strip.appendChild(readModeChip(s));
   const link=s.link_test||{};
   const lk=el('span','chip'+(link.state==='ok'?' on':(link.state==='bad'?' bad':''))+' testable',
               '链路 '+(link.testing?'测试中…':link.text));
@@ -514,6 +534,7 @@ function stateKey(s){
   const m=s.messages||[],last=m[m.length-1]||{};
   const meta=s.suggestion_meta||{};
   return [meta.ts_utc||'',m.length,last.ts_utc||'',s.collecting?1:0,
+          (s.read_mode||{}).mode||'',((s.read_mode||{}).last||{}).via||'',
           (s.check&&s.check.last_check_utc)||'',(s.suggestions||[]).length,
           m.filter(x=>x.manual).length].join('|');
 }
@@ -524,13 +545,16 @@ function selecting(){
 async function tick(){
   if(busy||document.hidden)return;            // 页面在后台就别轮询了
   const s=await api('/api/state');
+  lastState=s;                                // 切读取路线时要拿当前值算下一条
   if(stateKey(s)===lastKey)return;            // 没变化：一个 DOM 都不碰
   if(selecting())return;                      // 正在选字：等他选完
   render(s);
 }
 async function refresh(){
   try{
-    render(await api('/api/state'));
+    const s=await api('/api/state');
+    lastState=s;
+    render(s);
     if(!setup){
       await loadSetup();
       // 首次打开且还没配模型接口 —— 直接把配置弹出来，别让用户先撞一次“生成失败”
@@ -669,6 +693,25 @@ $('ctxText').addEventListener('input',e=>{
   const t=e.target;t.style.height='auto';t.style.height=Math.min(t.scrollHeight,120)+'px';
 });
 $('ctxAdd').onclick=addCtx;
+
+/* ---- 读取路线：点 chip 按 ui → db → auto → ui 轮换，写进 store/collect.yaml ---- */
+async function cycleReadMode(chipEl){
+  if(busy)return;
+  const rm=(lastState||{}).read_mode||{},order=['ui','db','auto'];
+  let i=order.indexOf(rm.mode);if(i<0)i=-1;
+  const next=order[(i+1)%order.length];
+  busy=true;
+  if(chipEl){chipEl.classList.add('testing');chipEl.textContent='切换中…'}
+  try{
+    const r=await api('/api/readmode',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:next})});
+    toast('读取路线已切成「'+next+'」',ICO.ok);
+  }catch(e){
+    if(e.message!=='未登录')toast('切换失败：'+e.message,ICO.bad);
+  }
+  busy=false;
+  await refresh();
+}
 
 /* ---- 模型链路测试：点状态条上的「链路」chip，真连一次已保存的接口 ---- */
 async function testLink(chipEl){

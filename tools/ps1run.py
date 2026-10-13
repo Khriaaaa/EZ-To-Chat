@@ -35,8 +35,10 @@ def push(local_path, remote_path):
     src = open(local_path, "rb").read()
     data = b"\xef\xbb\xbf" + src            # UTF-8 BOM，PS 5.1 才会按 UTF-8 读
     b64 = base64.b64encode(data).decode()
+    # 单引号字符串里 ' 要写成 ''：remote_path 可能来自含引号的目录名，
+    # 不转义就是命令注入面（审计 F-16）
     script = ("[IO.File]::WriteAllBytes('%s',[Convert]::FromBase64String('%s'))"
-              % (remote_path, b64))
+              % (remote_path.replace("'", "''"), b64))
     out = ga("ps", script)
     if "exitcode: 0" not in out:
         print("[!] 写入失败:", out[-300:])
@@ -47,7 +49,8 @@ def push(local_path, remote_path):
 def launch(remote_ps1):
     ps = ("Start-Process 'C:\\dl\\PsExec64.exe' -ArgumentList "
           "'-accepteula','-nobanner','-i','1','-d','powershell.exe',"
-          "'-NoProfile','-ExecutionPolicy','Bypass','-File','%s'" % remote_ps1)
+          "'-NoProfile','-ExecutionPolicy','Bypass','-File','%s'"
+          % remote_ps1.replace("'", "''"))
     return ga("ps", ps)
 
 
@@ -55,7 +58,8 @@ def wait_for(remote_out, seconds, min_bytes=1):
     """轮询 guest 侧文件大小。注意只认 out-data 那一行，CLIXML 里也有数字会骗人。"""
     t0 = time.time()
     while time.time() - t0 < seconds:
-        chk = ga("ps", "$p='%s'; if (Test-Path $p) { (Get-Item $p).Length } else { 'NO' }" % remote_out)
+        chk = ga("ps", "$p='%s'; if (Test-Path $p) { (Get-Item $p).Length } else { 'NO' }"
+                 % remote_out.replace("'", "''"))
         val = 0
         for line in chk.splitlines():
             line = line.strip()

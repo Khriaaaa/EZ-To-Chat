@@ -28,7 +28,12 @@ $ErrorActionPreference = 'Continue'
 $RuntimeDir = Join-Path $DataDir 'runtime'
 $UA         = 'wx-reply-assistant'
 $PY_VER     = '3.11.9'
-$WA_API     = 'https://api.github.com/repos/microsoft/winappCli/releases/latest'
+# winapp 下载锁死在具体版本 + SHA256（审计 F-01）：不用 releases/latest 动态挑资产，
+# 下载链路（第三方镜像/劫持）改一个字节都会在哈希校验那里被挡下。
+# 升版本时：改 $WA_TAG，并把 $WA_ZIP_SHA256 换成新 zip 的 sha256（GitHub 附件页可算）。
+$WA_TAG        = 'v0.7.1'
+$WA_ZIP_SHA256 = 'd925d1e32cdc320b6d271f653fd2cd3c05b5d7558deb20d1b548bead77900fcf'
+$WA_API     = "https://api.github.com/repos/microsoft/winappCli/releases/tags/$WA_TAG"
 
 $items = New-Object System.Collections.ArrayList
 $notes = New-Object System.Collections.ArrayList
@@ -74,6 +79,21 @@ function FetchAny($urls, [string]$dst, [int]$secs) {
     return $false
 }
 
+function Assert-ZipSafe([string]$zipPath) {
+    # 防 zip-slip：条目名不许绝对路径/盘符/含 ..（Expand-Archive 的行为随 .NET 版本
+    # 漂移，审计 F-01 待确认项 T-1 —— 自己先把入口卡死）
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $z = [IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        foreach ($e in $z.Entries) {
+            $n = $e.FullName
+            if ($n -match '^[/\\]' -or $n -match '^[A-Za-z]:' -or (($n -split '[/\\]') -contains '..')) {
+                throw "zip 条目路径不安全：$n"
+            }
+        }
+    } finally { $z.Dispose() }
+}
+
 function Get-WinappUrls {
     $rel = Invoke-RestMethod -Uri $WA_API -Headers @{ 'User-Agent' = $UA } -TimeoutSec 30
     $asset = $rel.assets | Where-Object { $_.name -match 'x64.*\.zip$' } | Select-Object -First 1
@@ -95,15 +115,22 @@ if ($DownloadOnly) {
             $urls = Get-WinappUrls
             Lg ('urls=' + ($urls -join ' | '))
             if (FetchAny $urls $zip 900) {
-                $dst = Join-Path $RuntimeDir 'winapp'
-                if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue }
-                New-Item -ItemType Directory -Path $dst -Force | Out-Null
-                Expand-Archive -Path $zip -DestinationPath $dst -Force
-                Remove-Item $zip -Force -ErrorAction SilentlyContinue
-                # 压缩包里带 331MB 的 .pdb 调试符号，安装包里是剔掉的，这里也剔掉
-                Get-ChildItem $dst -Recurse -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-                $exe = Get-ChildItem $dst -Recurse -Filter 'winapp.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-                if ($exe) { Lg ('OK ' + $exe.FullName) } else { Lg 'FAIL 解压后没有 winapp.exe' }
+                $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+                if ($h -ne $WA_ZIP_SHA256) {
+                    Lg "FAIL 哈希校验不过（期望 $WA_ZIP_SHA256，实际 $h）—— 上游更新或链路被改，先别装"
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                } else {
+                    Assert-ZipSafe $zip
+                    $dst = Join-Path $RuntimeDir 'winapp'
+                    if (Test-Path $dst) { Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue }
+                    New-Item -ItemType Directory -Path $dst -Force | Out-Null
+                    Expand-Archive -Path $zip -DestinationPath $dst -Force
+                    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+                    # 压缩包里带 331MB 的 .pdb 调试符号，安装包里是剔掉的，这里也剔掉
+                    Get-ChildItem $dst -Recurse -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                    $exe = Get-ChildItem $dst -Recurse -Filter 'winapp.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($exe) { Lg ('OK ' + $exe.FullName) } else { Lg 'FAIL 解压后没有 winapp.exe' }
+                }
             } else { Lg 'FAIL 所有下载源都没成' }
         }
     } catch { Lg ('FAIL ' + $_.Exception.Message) }
@@ -253,15 +280,17 @@ if (-not $conn) {
     Add-Item 'port' "面板端口 $Port" 'ok' '空着'
 } else {
     $owner = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-    # 「是不是自己」只认证据：命令行指向本应用的 assistant.py，或可执行文件落在安装目录里。
+    # 「是不是自己」只认证据（复核 F-10）：命令行要同时指向安装目录 + 本应用脚本，或可执行文件落在安装目录里。
     # 不能只看进程名是 python/pythonw —— 那会把用户机器上任何占用本端口的 python 服务一起杀掉。
     $mine = $false
     if ($owner) {
         $cmd = ''
         try { $cmd = (Get-CimInstance Win32_Process -Filter ("ProcessId=" + $conn.OwningProcess) -ErrorAction SilentlyContinue).CommandLine } catch {}
-        if ($cmd -and $ResDir -and $cmd.ToLower().Contains($ResDir.ToLower())) { $mine = $true }
-        elseif ($cmd -and $cmd -match 'assistant\.py') { $mine = $true }
-        elseif ($owner.Path -and $ResDir -and $owner.Path.ToLower().StartsWith($ResDir.ToLower())) { $mine = $true }
+        # 前缀必须以「\」收尾（复核 R2-5）：不然 ...\wx-reply-assistant-backup\
+        # 也会被 ...\wx-reply-assistant 的前缀匹配命中，整目录误杀。
+        $dirN = ($ResDir.TrimEnd('\') + '\').ToLower()
+        if ($cmd -and $dirN.Length -gt 1 -and $cmd.ToLower().Contains($dirN) -and $cmd -match 'assistant\.py|server\.py') { $mine = $true }
+        elseif ($owner.Path -and $dirN.Length -gt 1 -and $owner.Path.ToLower().StartsWith($dirN)) { $mine = $true }
     }
     if ($mine -and $Fix) {
         try { Stop-Process -Id $owner.Id -Force -ErrorAction Stop; Add-Item 'port' "面板端口 $Port" 'ok' "清掉了上次残留的 $($owner.ProcessName) #$($owner.Id)" }

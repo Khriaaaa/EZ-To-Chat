@@ -14,6 +14,7 @@ import base64
 import fcntl
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -27,6 +28,11 @@ import vmcfg                                     # noqa: E402
 def agent(payload):
     if not vmcfg.QGA_UUID:
         sys.exit("没配虚机 UUID：设 WXREPLY_QGA_UUID，或写 config.local.yaml 的 vm.qga_uuid")
+    if not re.match(r"^[0-9a-fA-F-]{36}$", vmcfg.QGA_UUID):
+        # UUID 直接拼进远端 shell 命令：形状不对（含 ; $() 之类）就是在注入。
+        # 先卡死格式再拼，别指望 shell 引用（审计 F-16）。
+        sys.exit("QGA UUID 格式不对（应形如 xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx）：%r"
+                 % (vmcfg.QGA_UUID,))
     # 共用一个互斥锁：多个 virsh qemu-agent-command 并发时响应会串台
     # （A 的命令收到 B 的结果），表现就是随机「guest agent 无响应」或拿到别人的输出
     os.makedirs(os.path.dirname(vmcfg.QGA_LOCK) or ".", exist_ok=True)

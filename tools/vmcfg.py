@@ -55,8 +55,14 @@ def ssh_cmd():
     if not SSH_HOST:
         raise SystemExit("没配虚机 SSH：设 WXREPLY_SSH=user@host（配 WXREPLY_SSH_PW），"
                          "或写 config.local.yaml 的 vm.ssh / vm.ssh_pw")
-    base = ["ssh", "-o", "StrictHostKeyChecking=no", "-n", SSH_HOST]
-    return (["sshpass", "-p", SSH_PW] + base) if SSH_PW else base
+    # accept-new：首次连接信任、之后按 known_hosts 校验 —— 别再 no 了，
+    # 那等于每次连接都可能连到伪装的主机（审计 F-08）。
+    base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-n", SSH_HOST]
+    if SSH_PW:
+        # sshpass 会把口令放进本机进程命令行（ps 可见）。能配公钥就用公钥，
+        # 这条路只为兼容现有配置保留，别再扩散。
+        return ["sshpass", "-p", SSH_PW] + base
+    return base
 
 
 def ensure_work():

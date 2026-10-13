@@ -14,6 +14,7 @@
     winapp.exe         —— 先找本地 C:\\winapp-cli，没有就下 GitHub Releases（MIT，可再分发）
 """
 import argparse
+import hashlib
 import io
 import os
 import shutil
@@ -34,6 +35,10 @@ MIRRORS = [
 ]
 PIP_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
 SITE_PKGS = os.path.join(PYDIR, "Lib", "site-packages")
+# winapp 下载锁死在具体版本 + SHA256（审计 F-01）；升版本时同步改
+# desktop/preflight.ps1 与 scripts/setup-windows.ps1 里的同名常量
+WINAPP_TAG = "v0.7.1"
+WINAPP_ZIP_SHA256 = "d925d1e32cdc320b6d271f653fd2cd3c05b5d7558deb20d1b548bead77900fcf"
 
 
 def fetch(url, dest, timeout=180):
@@ -64,6 +69,9 @@ def get_embeddable(version):
         shutil.rmtree(PYDIR)
     os.makedirs(PYDIR)
     with zipfile.ZipFile(dest) as z:
+        for n in z.namelist():
+            if n.startswith("/") or ".." in n.replace("\\", "/").split("/") or (len(n) > 1 and n[1] == ":"):
+                raise SystemExit("embeddable 包里有不安全条目：%s" % n)
         z.extractall(PYDIR)
     print("解包到", PYDIR)
 
@@ -83,11 +91,24 @@ def get_wheels(version):
         shutil.rmtree(whl_dir)
     os.makedirs(whl_dir)
     short = "".join(version.split(".")[:2])
-    cmd = [sys.executable, "-m", "pip", "download", "--dest", whl_dir,
-           "--only-binary=:all:", "--platform", "win_amd64",
-           "--python-version", version.rsplit(".", 1)[0],
-           "--implementation", "cp", "--abi", "cp" + short,
-           "-i", PIP_INDEX, "pillow", "numpy", "pyyaml"]
+    # 锁文件在项目根（和 install.sh 共用同一份），不在 desktop/ 下（复核 R2-1）
+    lock = os.path.join(os.path.dirname(DESKTOP), "requirements.lock")
+    if os.path.isfile(lock):
+        # 有锁文件就按锁下（--require-hashes 全哈希校验）—— 和 install.sh 同一道
+        # 供应链闸门（复核 F-15）。锁里的版本要求 py3.11+，与嵌入式运行时一致。
+        cmd = [sys.executable, "-m", "pip", "download", "--dest", whl_dir,
+               "--only-binary=:all:", "--platform", "win_amd64",
+               "--python-version", version.rsplit(".", 1)[0],
+               "--implementation", "cp", "--abi", "cp" + short,
+               "--require-hashes", "-r", lock, "-i", PIP_INDEX]
+    else:
+        print("⚠️ 找不到 requirements.lock —— 本次按「pillow/numpy/pyyaml 最新版」下载，"
+              "没有哈希校验（供应链闸门失效）。打包发货前先把锁文件放进项目根。")
+        cmd = [sys.executable, "-m", "pip", "download", "--dest", whl_dir,
+               "--only-binary=:all:", "--platform", "win_amd64",
+               "--python-version", version.rsplit(".", 1)[0],
+               "--implementation", "cp", "--abi", "cp" + short,
+               "-i", PIP_INDEX, "pillow", "numpy", "pyyaml"]
     print("pip download ...")
     r = subprocess.run(cmd)
     if r.returncode != 0:
@@ -123,11 +144,18 @@ def get_winapp(local_dir):
             print("拷", n, os.path.getsize(os.path.join(WINAPPDIR, n)), "bytes")
     else:
         zip_path = os.path.join(VENDOR, "winapp-cli.zip")
-        url = ("https://github.com/microsoft/winappCli/releases/latest/download/"
-               "winapp-cli-win-x64.zip")
+        # 锁死版本 + SHA256（审计 F-01）：不用 releases/latest 动态挑资产，
+        # 下载链路上任何一环改了内容，都会在解压前先失败
+        url = ("https://github.com/microsoft/winappCli/releases/download/"
+               "%s/winappcli-x64.zip" % WINAPP_TAG)
         fetch(url, zip_path)
+        digest = hashlib.sha256(open(zip_path, "rb").read()).hexdigest()
+        if digest != WINAPP_ZIP_SHA256:
+            raise SystemExit("winapp 包哈希不对（期望 %s，实际 %s）" % (WINAPP_ZIP_SHA256, digest))
         with zipfile.ZipFile(zip_path) as z:
             for n in z.namelist():
+                if n.startswith("/") or ".." in n.replace("\\", "/").split("/") or (len(n) > 1 and n[1] == ":"):
+                    raise SystemExit("winapp 包里有不安全条目：%s" % n)
                 base = os.path.basename(n)
                 if base in need:
                     with z.open(n) as srcf, open(os.path.join(WINAPPDIR, base), "wb") as out:

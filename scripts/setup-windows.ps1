@@ -36,7 +36,11 @@ $script:buf   = New-Object System.Collections.ArrayList
 $script:rows  = @()
 $AllowChange  = -not $NoAuto
 $ProgressFile = Join-Path $env:TEMP 'wxreply-setup.progress'
-$GH_API       = 'https://api.github.com/repos/microsoft/winappCli/releases/latest'
+# winapp 下载锁死在具体版本 + SHA256（审计 F-01）；升版本时同步改
+# desktop/preflight.ps1 与 desktop/scripts/make-vendor.py 里的同名常量
+$WA_TAG        = 'v0.7.1'
+$WA_ZIP_SHA256 = 'd925d1e32cdc320b6d271f653fd2cd3c05b5d7558deb20d1b548bead77900fcf'
+$GH_API       = "https://api.github.com/repos/microsoft/winappCli/releases/tags/$WA_TAG"
 $PSEXEC_URL   = if ($PsexecUrl) { $PsexecUrl } else { 'https://live.sysinternals.com/PsExec64.exe' }
 $MIN_PSEXEC   = 100000
 
@@ -136,6 +140,29 @@ function Get-WinappPath {
     return $null
 }
 
+function Assert-ZipSafe([string]$zipPath) {
+    # 防 zip-slip：条目名不许绝对路径/盘符/含 ..（Expand-Archive 的行为随 .NET 版本
+    # 漂移，审计 F-01 待确认项 T-1 —— 自己先把入口卡死）
+    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+    $z = [IO.Compression.ZipFile]::OpenRead($zipPath)
+    try {
+        foreach ($e in $z.Entries) {
+            $n = $e.FullName
+            if ($n -match '^[/\\]' -or $n -match '^[A-Za-z]:' -or (($n -split '[/\\]') -contains '..')) {
+                throw "zip 条目路径不安全：$n"
+            }
+        }
+    } finally { $z.Dispose() }
+}
+
+function Test-PsexecSigned([string]$p) {
+    # 签名校验（审计 F-01）：PsExec 会被当可执行文件启动，必须是微软签名且证书链完整
+    try {
+        $sig = Get-AuthenticodeSignature -FilePath $p
+        return ($sig.Status -eq 'Valid' -and $sig.SignerCertificate -and ($sig.SignerCertificate.Subject -match 'Microsoft'))
+    } catch { return $false }
+}
+
 function Download-Winapp {
     $zip = Join-Path $env:TEMP 'wxreply-winapp.zip'
     $url = $WinappUrl
@@ -148,6 +175,11 @@ function Download-Winapp {
     }
     Set-Progress 'winapp' 0 0 'dl' ''
     Save-WithProgress $url $zip 'winapp'
+    $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($h -ne $WA_ZIP_SHA256) {
+        throw "winapp 包哈希不对（期望 $WA_ZIP_SHA256，实际 $h）—— 上游更新或下载链路被改，拒绝解压"
+    }
+    Assert-ZipSafe $zip
     Set-Progress 'winapp' 0 0 'exp' ''
     if (-not (Test-Path $WinappDir)) { New-Item -ItemType Directory -Path $WinappDir -Force | Out-Null }
     Expand-Archive -Path $zip -DestinationPath $WinappDir -Force
@@ -162,6 +194,11 @@ function Download-Psexec {
     Save-WithProgress $PSEXEC_URL $Psexec 'psexec'
     if (-not (Test-Path $Psexec)) { throw '下载没落地，检查网络或代理' }
     if ((Get-Item $Psexec).Length -lt $MIN_PSEXEC) { throw '下回来的文件太小，可能被拦截或断流了' }
+    if (-not (Test-PsexecSigned $Psexec)) {
+        # 坏文件不留盘（复核 F-01 旁路）：留着的话下次 Test-Path 会把它当「已装」放过去
+        Remove-Item $Psexec -Force -ErrorAction SilentlyContinue
+        throw "PsExec 数字签名校验不过 —— 已删除可疑文件，拒绝使用（可能被劫持/篡改）"
+    }
 }
 
 # ================================================================ 内部模式：后台下载
@@ -170,6 +207,7 @@ if ($DownloadOnly) {
         Set-Progress 'init' 0 0 'dl' ''
         if (-not (Get-WinappPath)) { Download-Winapp }
         if (-not (Test-Path $Psexec)) { Download-Psexec }
+        elseif (-not (Test-PsexecSigned $Psexec)) { Download-Psexec }   # 旧的没验过/被换过：重下一份
         Set-Progress 'done' 0 0 'done' 'ok'
         exit 0
     } catch {
@@ -227,8 +265,15 @@ function Invoke-Checks {
     # ---------------------------------------------------------------- PsExec64
     Write-Step 'PsExec64（注入交互会话用）'
     if (Test-Path $Psexec) {
-        $kb = [math]::Round((Get-Item $Psexec).Length / 1KB)
-        Add-Row 'PsExec64' 'ok' "$Psexec（$kb KB）"
+        if (Test-PsexecSigned $Psexec) {
+            $kb = [math]::Round((Get-Item $Psexec).Length / 1KB)
+            Add-Row 'PsExec64' 'ok' "$Psexec（$kb KB，签名通过）"
+        } elseif ($AllowChange) {
+            # 已存在的文件也要验签（复核 F-01 旁路）：状态记「缺」→ 走后台重下覆盖
+            Add-Row 'PsExec64' '缺' "已存在但签名校验不过 —— 重新下载覆盖"
+        } else {
+            Add-Row 'PsExec64' 'FAIL' "已存在但签名校验不过（可疑）：$Psexec —— 删掉重跑"
+        }
     } elseif ($AllowChange) {
         Add-Row 'PsExec64' '缺' "没有 —— 装到 $Psexec"
     } else {

@@ -49,7 +49,7 @@ https://github.com/Khriaaaa/wx-reply-assistant/releases/latest/download/wx-reply
 - 一个能读 UIA 的命令行工具（实测 winapp-cli 0.7.1，见 2.2）
 - **跑采集器这台机器要能 ssh 到一个能 `sudo virsh` 的宿主** —— 命令是通过宿主上的
   `virsh qemu-agent-command` 送进虚机的，不是直连 Windows。虚机就建在这台宿主上
-- Python 3.9+，三个第三方包：`pillow`、`numpy`、`pyyaml`，其余全是标准库
+- Python 3.11+（依赖锁文件 requirements.lock 的要求），三个第三方包：`pillow`、`numpy`、`pyyaml`，其余全是标准库
 - 一个 OpenAI 兼容的 `/chat/completions` 端点（地址 + key + 模型名）
 
 ## 2 Windows 侧

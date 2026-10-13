@@ -17,6 +17,8 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from render_history import load_history_ctx
 
 import yaml
 
@@ -96,6 +98,8 @@ LEAD_MODEL = os.environ.get("WXREPLY_LEAD_MODEL", BUNDLED_LEAD[1])
 # 所以这里自己管总预算：每个 provider 只分到「剩余预算」，用完就带着每个候选的
 # 真实原因退出。调用方的超时取 budget + 30 即可，不需要跟着链长改。
 BUDGET_SEC = float(os.environ.get("WXREPLY_BUDGET", "150"))
+# 历史上下文条数上限（展开条数计），见 orchestrator/render_history.py
+HISTORY_LIMIT = 40
 
 
 def pick_session(msgs):
@@ -218,7 +222,11 @@ def build_transcript(msgs, session, limit):
         else:
             who = "未知"
         t = m.get("time_hint") or ""
-        lines.append(f"[{t}] {who}: {m.get('text', '')}" if t else f"{who}: {m.get('text', '')}")
+        # 单条消息长度封顶（审计 F-11）：对方可以发超长文本，不封顶会挤爆 prompt 预算
+        txt = str(m.get("text", ""))
+        if len(txt) > 2000:
+            txt = txt[:2000] + " …[截断]"
+        lines.append(f"[{t}] {who}: {txt}" if t else f"{who}: {txt}")
     # 顺带把最后一条「对方」消息的指纹带出去：自检线程靠它判断「建议是不是已经
     # 跟上最新消息」。故意不看最后一条是不是我发的 —— 我方消息不该触发新一轮生成
     # （watch 侧同样只认 sender=="them"），否则我自己每发一条消息，自检就白烧一次模型。
@@ -306,6 +314,22 @@ def load_providers(override=None):
     die("没解析出任何可用的 provider（找过 " + ", ".join(tried) + "）", code=EXIT_NO_PROVIDER)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不许 urllib 跟着 3xx 走。
+
+    默认 opener 会跟随 3xx，把带 Authorization 的请求转发到 Location 指定的
+    任意地址（含内网）—— API Key 一起送过去（审计 F-03；本地实测 301/302/303
+    都会转发）。redirect_request 返回 None → urllib 直接抛 HTTPError，下面的
+    错误分支会把它当「HTTP 3xx」报失败。面板侧有同样的实现（web/server.py）。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def _try_one(base, key, model, prompt_text, verbose, timeout=120):
     """打一发；成功返回 content 字符串，失败抛 Exception（带真实原因）。"""
     body = {
@@ -331,8 +355,9 @@ def _try_one(base, key, model, prompt_text, verbose, timeout=120):
         headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode("utf-8", "replace")
+        with _opener.open(req, timeout=timeout) as r:
+            # 响应大小封顶（审计 F-18）：恶意/故障 provider 返回超大响应时别把内存打爆
+            raw = r.read(300000).decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         raise ProviderError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:400]}") from None
     except Exception as e:
@@ -497,13 +522,22 @@ def main():
                     help=f"整条候选链的总时间预算（秒），默认 {BUDGET_SEC:.0f}")
     ap.add_argument("--force", action="store_true",
                     help="同一份记录已经生成过也再来一次（面板手动点「生成」走这个）")
+    ap.add_argument("--no-history", action="store_true",
+                    help="不给 prompt 加历史库背景（A/B 对照测试用）")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
     msgs = load_messages(a.messages)
     session = a.session or pick_session(msgs)     # 规则只此一份，见 pick_session()
     transcript, n, last_fp = build_transcript(msgs, session, a.limit)
+    # 历史背景：历史库里的这个会话，只读不回写。渲染表在 render_history.py 一份
+    # 收口（撤回留、系统通知滤、泄漏链接占位、quote 不猜原句）。--no-history 关。
+    hist = "" if a.no_history else load_history_ctx(session, limit=HISTORY_LIMIT)
     prompt = PROMPT.read_text(encoding="utf-8").rstrip("\n") + "\n\n" + transcript + "\n"
+    if hist:
+        prompt += ("\n---\n\n以下是同一人的更早聊天历史（供参考语气、称呼和常用梗，"
+                   "不是现在这段对话；候选回帖别提历史里已经过八百年的具体事件）：\n\n"
+                   + hist + "\n")
 
     if a.dry_run:
         print(prompt)

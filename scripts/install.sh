@@ -31,9 +31,10 @@ printf '微信回复助手 · 环境准备\n目录 %s\n' "$ROOT"
 # ---------------------------------------------------------------- 1 Python
 step "[1/5] Python"
 PY="${PYTHON:-python3}"
-command -v "$PY" >/dev/null 2>&1 || die "找不到 $PY，先装 Python 3.9 或更高"
-"$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' \
-  || die "$("$PY" -V) 太老，需要 3.9+"
+# 锁文件（requirements.lock）里的 numpy/pillow 要求 3.11+，嵌入式运行时也是 3.11
+command -v "$PY" >/dev/null 2>&1 || die "找不到 $PY，先装 Python 3.11 或更高"
+"$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+  || die "$("$PY" -V) 太老，需要 3.11+（依赖锁文件的要求）"
 ok "$("$PY" -V)"
 
 # ---------------------------------------------------------------- 2 venv
@@ -50,9 +51,17 @@ fi
 
 # ---------------------------------------------------------------- 3 依赖
 step "[3/5] Python 依赖"
-"$VPY" -m pip install -q --disable-pip-version-check -r requirements.txt \
-  || die "装依赖失败 —— 国内网络可换镜像重试：
+# 有 requirements.lock 就按锁文件装（版本+哈希固定，供应链多一道闸，审计 F-15）；
+# 没有就退回 requirements.txt。镜像换源照样可用：哈希是对文件内容算的，镜像文件一致。
+if [ -f "$ROOT/requirements.lock" ]; then
+  "$VPY" -m pip install -q --disable-pip-version-check --require-hashes -r "$ROOT/requirements.lock" \
+    || die "装依赖失败（锁文件）—— 国内网络可换镜像重试：
   PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple bash scripts/install.sh"
+else
+  "$VPY" -m pip install -q --disable-pip-version-check -r requirements.txt \
+    || die "装依赖失败 —— 国内网络可换镜像重试：
+  PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple bash scripts/install.sh"
+fi
 "$VPY" - <<'PY' || die "依赖装上了但 import 不进来，看上面的报错"
 import PIL, numpy, yaml
 print(f'  \u2713 pillow {PIL.__version__} · numpy {numpy.__version__} · pyyaml {yaml.__version__}')
