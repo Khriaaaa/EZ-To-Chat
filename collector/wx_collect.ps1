@@ -74,7 +74,19 @@ if (Test-Path $LockFile) {
     if ($staleRaw -and ($staleRaw.Trim() -match '^\d+$')) { $staleId = [int]$staleRaw.Trim() }
     $staleAlive = $false
     if ($staleId -gt 0) { $staleAlive = [bool](Get-Process -Id $staleId -ErrorAction SilentlyContinue) }
-    if (-not $staleAlive) {
+    if ($staleId -eq 0) {
+        # 空/半截的锁：另一个进程刚 CreateNew、还没把 PID 写进去（亚秒窗口）。
+        # 只按内容判「陈旧」就会在这里删掉它，然后谁都抢到锁 —— 两份采集同时跑。
+        # 所以看年纪：15 秒内的空锁当「正在写」，退出等它（评审 B22）。
+        $lockAge = 999
+        try { $lockAge = ((Get-Date) - (Get-Item $LockFile).LastWriteTime).TotalSeconds } catch {}
+        if ($lockAge -lt 15) {
+            Write-Log ('lock file just created (age=' + [int]$lockAge + 's content=' + $staleRaw + '); exit (pid=' + $PID + ')')
+            exit 0
+        }
+        Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+        Write-Log ('stale empty lock removed (age=' + [int]$lockAge + 's)')
+    } elseif (-not $staleAlive) {
         Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
         Write-Log ('stale lock removed (holder=' + $staleRaw + ')')
     }

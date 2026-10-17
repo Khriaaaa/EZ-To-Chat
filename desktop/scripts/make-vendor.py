@@ -84,6 +84,17 @@ def get_embeddable(version):
     print("写", os.path.basename(pth))
 
 
+def _unsafe_member(name):
+    """zip 条目名不安全（绝对路径 / 上跳 / 盘符）→ True。
+
+    wheel 与 winapp 包统一走这一个判断（评审 B8）：wheel 名字由 PyPI 决定，
+    但没理由相信压缩包里的路径。
+    """
+    n = name.replace("\\", "/")
+    return (n.startswith("/") or ".." in n.split("/")
+            or (len(n) > 1 and n[1] == ":"))
+
+
 def get_wheels(version):
     os.makedirs(SITE_PKGS, exist_ok=True)
     whl_dir = os.path.join(VENDOR, "wheels")
@@ -123,7 +134,12 @@ def get_wheels(version):
                 # .data 段（如果有）按 wheel 规范该铺到 sys.prefix，这几个包都没有，忽略
                 if ".data/" in member:
                     continue
+                if _unsafe_member(member):
+                    raise SystemExit("%s 里有不安全条目：%s" % (name, member))
                 target = os.path.join(SITE_PKGS, member)
+                if os.path.commonpath([os.path.abspath(SITE_PKGS),
+                                       os.path.abspath(target)]) != os.path.abspath(SITE_PKGS):
+                    raise SystemExit("%s 的条目跑出 site-packages：%s" % (name, member))
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with z.open(member) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out)
@@ -154,7 +170,7 @@ def get_winapp(local_dir):
             raise SystemExit("winapp 包哈希不对（期望 %s，实际 %s）" % (WINAPP_ZIP_SHA256, digest))
         with zipfile.ZipFile(zip_path) as z:
             for n in z.namelist():
-                if n.startswith("/") or ".." in n.replace("\\", "/").split("/") or (len(n) > 1 and n[1] == ":"):
+                if _unsafe_member(n):
                     raise SystemExit("winapp 包里有不安全条目：%s" % n)
                 base = os.path.basename(n)
                 if base in need:

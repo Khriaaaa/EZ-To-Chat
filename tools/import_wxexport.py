@@ -211,11 +211,15 @@ def main():
     files = sorted(f for f in os.listdir(src) if f.endswith(".txt") and f != "00_索引.txt")
     print(f"源 {src}\n  索引 {len(index)} 个会话，{len(files)} 个 txt")
 
+    # 先在 .building 上重建，成功才原子替换（评审 B9）：中途失败/断电只会留下
+    # 一个临时库，原来的 history.db 一点没动 —— 旧实现先删再建，失败就没历史了。
+    build = out + ".building"
     if not a.dry_run:
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        if os.path.exists(out):
-            os.remove(out)
-        con = sqlite3.connect(out)
+        for p in (build, build + "-wal", build + "-shm"):
+            if os.path.exists(p):
+                os.remove(p)          # 上一轮崩了留下的半成品
+        con = sqlite3.connect(build)
         con.executescript("""
           PRAGMA journal_mode=WAL;
           CREATE TABLE messages(
@@ -325,11 +329,18 @@ def main():
         nm = con.execute("select sum(dup_count) from messages where sender='me'").fetchone()[0]
         run = con.execute("select count(*) from messages where dup_count>1").fetchone()[0]
         rng = con.execute("select min(ts_utc), max(ts_utc) from messages").fetchone()
+        size_mb = os.path.getsize(build) / 1048576
+        try:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        con.close()
+        os.replace(build, out)        # 到这一步旧库才被换掉
         print(f"\n入库 {rows:,} 行（折叠前 {n:,} 条，我 {nm:,} / 对方 {n - nm:,}），"
               f"{len(per)} 个会话")
         print(f"  折叠了 {run:,} 组连发，省下 {n - rows:,} 行")
         print(f"  时间跨度 {rng[0]} ~ {rng[1]}")
-        print(f"  大小 {os.path.getsize(out)/1048576:.1f} MB -> {out}")
+        print(f"  大小 {size_mb:.1f} MB -> {out}")
         if special:
             print(f"  剔除群聊/企微 {len(special)} 个会话"
                   f"（eztochat 只做个人会话；要留加 --include-special）")
