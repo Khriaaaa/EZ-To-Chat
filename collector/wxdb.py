@@ -12,6 +12,7 @@
 与 UI 路线的关系：两条路都往 store/messages.jsonl 写同一种行（session/sender/text/fp），
 下游 watch/generate/panel 完全不用改。选哪条路由 collector/readmode.py 决定。
 """
+import atexit
 import base64
 from contextlib import suppress
 import ctypes
@@ -35,6 +36,22 @@ try:                       # 直接跑（collector 目录在 sys.path 上）
     import storelock
 except ImportError:        # 被当包导入时
     from collector import storelock  # type: ignore
+
+# 进程退出时把本轮落过盘的明文副本删掉。解密副本不再每轮删（删了 WAL 快路就
+# 永远走不到，每轮都要整库 AES），改成「进程活着期间保留、退出时清」：
+# 明文只在采集器运行时存在，和它本来就有窗口是同一个暴露面。
+_PLAIN_TO_PURGE = set()
+
+
+def _purge_plain():
+    for p in list(_PLAIN_TO_PURGE):
+        for suffix in ("", "-wal", "-shm", ".part", ".stamp"):
+            with suppress(OSError):
+                os.remove(p + suffix)
+    _PLAIN_TO_PURGE.clear()
+
+
+atexit.register(_purge_plain)
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"      # 长文本压缩帧（不引第三方解压库，先占位）
 DLL_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
@@ -185,6 +202,7 @@ def decrypt_db(src, key, dst, with_wal=True):
             with open(tmp, "wb") as fo:
                 _try_chmod(tmp, 0o600)
                 pgno = 1
+                first_bad = False
                 while True:
                     page = fi.read(PAGE_SZ)
                     if len(page) < PAGE_SZ:
@@ -194,13 +212,20 @@ def decrypt_db(src, key, dst, with_wal=True):
                         n += 1
                     else:
                         bad += 1
+                        if pgno == 1:
+                            first_bad = True
                         fo.write(b"\x00" * PAGE_SZ)       # 坏页占位，保住页号对齐
                     pgno += 1
                 fo.flush()
                 os.fsync(fo.fileno())
+            # 第 1 页对不上 = 密钥错或文件被写坏，后面每一页都只会是零洞：
+            # 这种副本必须当失败处理，不能让调用方当成「库里没消息」
+            if first_bad or not n:
+                raise Unavailable("第 1 页 HMAC 不过（密钥不对或库被写坏）")
             # WAL 合并：最新消息多半还在 WAL 里，不合并就会"读不到刚来的一句"
             merged = _merge_wal(src, tmp, enc_key, salt) if with_wal else 0
             os.replace(tmp, dst)
+            _PLAIN_TO_PURGE.add(dst)
         except BaseException:
             with suppress(OSError):
                 os.remove(tmp)
@@ -222,8 +247,14 @@ def _merge_wal(db_path, dst, enc_key, salt):
             head = f.read(32)
             if len(head) < 32:
                 return 0
+            magic = struct.unpack(">I", head[0:4])[0]
+            psz = struct.unpack(">I", head[8:12])[0]
+            # 只认自己认识的那种 WAL：页大小不同或文件头坏了就整轮放弃，
+            # 硬按 4096 帧去解会得到一堆错位的页（比不合并更糟）
+            if magic not in (0x377F0682, 0x377F0683) or psz != PAGE_SZ:
+                return 0
             h_salt = head[16:24]
-            frames, merged, pending = [], 0, []
+            frames, pending, db_pages_after = {}, [], 0
             while True:
                 fh = f.read(24)
                 if len(fh) < 24:
@@ -241,9 +272,11 @@ def _merge_wal(db_path, dst, enc_key, salt):
                 if pgno < 1 or not page_ok(enc_key, page, pgno, salt):
                     continue
                 if commit_after:
-                    frames.extend(pending)
+                    for p, pl in pending:
+                        frames[p] = pl
                     pending = []
-                    frames.append((pgno, decrypt_page(enc_key, page, pgno)))
+                    frames[pgno] = decrypt_page(enc_key, page, pgno)
+                    db_pages_after = commit_after
                 else:
                     pending.append((pgno, decrypt_page(enc_key, page, pgno)))
     except OSError:
@@ -252,11 +285,24 @@ def _merge_wal(db_path, dst, enc_key, salt):
     pending = None
     if not frames:
         return 0
+    cur_pages = os.path.getsize(dst) // PAGE_SZ
+    ordered = sorted(frames.items())          # 同页后写覆盖先写，按页号升序落
+    # 页号必须连续：WAL 里只提交了一部分新页时中间会留零洞，sqlite 打开就是
+    # "database disk image is malformed"。有洞就整轮放弃，下一轮走整库解密。
+    need = cur_pages
+    for pgno, _plain in ordered:
+        if pgno > need + 1:
+            return 0
+        need = max(need, pgno)
+    merged = 0
     with open(dst, "r+b") as f:
-        for pgno, plain in frames:
+        for pgno, plain in ordered:
             f.seek((pgno - 1) * PAGE_SZ)
             f.write(plain)
             merged += 1
+        # 提交帧里的「提交后页数」比当前小 = 库被裁过（VACUUM 等），尾巴要截掉
+        if db_pages_after and os.path.getsize(dst) > db_pages_after * PAGE_SZ:
+            f.truncate(db_pages_after * PAGE_SZ)
     return merged
 
 
@@ -731,11 +777,17 @@ def acquire_keys(account_dir, cache_dir, log=print):
         if k:
             keys[rel] = k
     missing = {r: p for r, p in files.items() if r not in keys}
-    if not missing or len(keys) > len(files) // 2:
-        if keys:
-            return keys, files
+    if not missing:
+        return keys, files
+    # 缓存不全是常态（微信会新建 message_N.db 分片，salt 不一样）。这里绝不能
+    # 用「命中过半就收工」：那样新分片永远拿不到钥匙，而 messages() 是按分片
+    # 吞错的，表现就是新分片的会话静默不进库（还没有任何报错）。
     pid = weixin_pid()
     if not pid:
+        if keys:
+            log("  ⚠️ 缺 %d 个库的钥匙（微信没开，内存取不了）：%s"
+                % (len(missing), ", ".join(sorted(missing))))
+            return keys, files
         raise Unavailable("没找到 Weixin.exe 进程（关着？）")
     log("  微信 pid=%d，尝试从内存取密钥" % pid)
     got = extract_master_key(pid)
@@ -753,6 +805,11 @@ def acquire_keys(account_dir, cache_dir, log=print):
             ks.put(rel, key)
     if not keys:
         raise Unavailable("拿不到任何库密钥（微信版本变了？先跑 dbcheck 看报告）")
+    still = {r: p for r, p in files.items() if r not in keys}
+    if still:
+        # 拿不全就明说：调用方要把这行带进 info，别让它表现成「一直没有新消息」
+        log("  ⚠️ %d 个库仍然没有密钥，本轮只读其余库：%s"
+            % (len(still), ", ".join(sorted(still))))
     return keys, files
 
 
@@ -770,15 +827,26 @@ class Reader:
         self.keys, self.files = acquire_keys(account_dir, cache_dir, log)
         os.makedirs(cache_dir, exist_ok=True)
         self._conns = {}
+        # 按分片吞掉的错误记在这里：collect 用完要报出来，并且别推进锚点
+        self.shard_errors = {}
+        self.missing_keys = sorted(set(self.files) - set(self.keys))
 
     def plain_path(self, rel):
         """解密副本路径（只含 ASCII，避免中文路径在 sqlite3 上的坑）。"""
         return os.path.join(self.cache_dir, self.wxid + "__" + rel.replace("/", "_"))
 
+    def _close_one(self, rel):
+        c = self._conns.pop(rel, None)
+        if c is not None:
+            with suppress(Exception):
+                c.close()
+
     def conn(self, rel):
-        """打开解密副本；stamp 变了才重新解密（原库 mtime/size/密钥指纹）。"""
-        if rel in self._conns:
-            return self._conns[rel]
+        """打开解密副本；stamp 变了才重新解密（原库 size/头尾/密钥指纹）。
+
+        每次调用都重算 stamp —— Reader 现在会在进程里活很久，缓存了连接却不
+        重算的话，新消息永远读不到（评审 B4）。
+        """
         src = self.files[rel]
         key = self.keys.get(rel)
         if not key:
@@ -793,12 +861,18 @@ class Reader:
                     old = f.read().strip()
             except OSError:
                 old = ""
+        if old == stamp and os.path.exists(dst):
+            if rel in self._conns:
+                return self._conns[rel]
+        else:
+            # 换副本前先关掉旧连接：Windows 上文件仍被 sqlite 打开着，os.replace 会失败
+            self._close_one(rel)
         # 主库正文没变（只动了 WAL）就只合并 WAL，别整库重解 —— 微信每写一句都会
         # 动 WAL，整库 AES 解密几十上百 MB 谁也扛不住；WAL 帧合并是幂等的。
         # 戳的前 4 段（key 指纹 / 大小 / 头摘要 / 尾摘要）= 主库身份；后 2 段是 WAL。
         full = (not os.path.exists(dst) or not old
                 or old.split("|")[:4] != stamp.split("|")[:4])
-        if not os.path.exists(dst) or old != stamp:
+        if old != stamp or not os.path.exists(dst):
             if full:
                 n, bad, merged = decrypt_db(src, key, dst)
                 if bad:
@@ -810,35 +884,46 @@ class Reader:
                     with open(src, "rb") as fh:
                         salt = fh.read(16)
                 merged = _merge_wal(src, dst, enc_key, salt)
+                if not merged:
+                    # 合并没成功（WAL 头不认识 / 页号有洞 / 没有可提交的帧）：退回
+                    # 整库解密。绝不能把「没合并」当成新戳写下去，否则新消息会
+                    # 一直读不到，直到主库自己变了（评审 B16）。
+                    n, bad, merged = decrypt_db(src, key, dst)
             with open(stamp_p, "w", encoding="utf-8") as f:
                 f.write(stamp)
+            _try_chmod(stamp_p, 0o600)
         _try_chmod(dst, 0o600)
         c = sqlite3.connect("file:%s?mode=ro" % dst.replace("?", "%3f"),
                             uri=True)
         c.text_factory = _text_factory
         c.row_factory = sqlite3.Row       # 查询里按列名取值，不靠下标顺序
+        # sqlite3.connect 是惰性的：真正的「解不开」要到第一条语句才抛。这里先
+        # 探活，好让调用方能区分「副本坏了」和「真的没有新消息」（评审 B18）。
+        try:
+            c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        except sqlite3.Error as e:
+            with suppress(Exception):
+                c.close()
+            for suffix in ("", "-wal", "-shm", ".stamp"):
+                with suppress(OSError):
+                    os.remove(dst + suffix)
+            _PLAIN_TO_PURGE.discard(dst)
+            raise Unavailable("%s 的解密副本打不开：%s" % (rel, e)) from e
         self._conns[rel] = c
         return c
 
-    def close(self):
-        for c in self._conns.values():
-            try:
-                c.close()
-            except Exception:                                # noqa: BLE001
-                pass
+    def close(self, purge=False):
+        """关连接。purge=True 连明文副本一起删（手动 dbcheck 用，别留驻）。"""
+        for rel in list(self._conns):
+            self._close_one(rel)
         self._conns = {}
-        # 解密副本是明文聊天库：用后即删，不留长期驻留面（审计 F-02）。
-        # 下一轮要用会按 stamp 重新解密或合并 WAL，毫秒级。
-        for rel in self.files:
-            # ".part"：decrypt_db / save / save_anchors 的半成品明文库/半截 JSON
-            #（复核 R2-2）—— 崩溃路径上留下来的也算明文驻留，一并清。
-            for suffix in ("", ".part", ".stamp", "-wal", "-shm"):
-                p = self.plain_path(rel) + suffix
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except OSError:
-                    pass
+        if purge:
+            for rel in self.files:
+                dst = self.plain_path(rel)
+                for suffix in ("", "-wal", "-shm", ".part", ".stamp"):
+                    with suppress(OSError):
+                        os.remove(dst + suffix)
+                _PLAIN_TO_PURGE.discard(dst)
 
     # -- 元数据 ------------------------------------------------------------
     def contacts(self):
@@ -855,7 +940,11 @@ class Reader:
         return out
 
     def session_list(self, limit=50):
-        """最近会话：[{'username','name','unread','preview','ts'}]，按时间倒序。"""
+        """最近会话：[{'username','name','unread','preview','ts'}]，按时间倒序。
+
+        读不出来就抛 Unavailable，绝不返回空表 —— 空表会被上层当成「没有会话」，
+        和解密失败长得一模一样，auto 模式就再也不会回落界面树（评审 B18）。
+        """
         rows = []
         try:
             cur = self.conn("session/session.db").execute(
@@ -865,8 +954,10 @@ class Reader:
             for r in cur:
                 rows.append({"username": r["username"], "unread": r["unread_count"],
                              "preview": r["summary"], "ts": r["last_timestamp"]})
-        except (sqlite3.Error, Unavailable, KeyError):
-            return []
+        except Unavailable:
+            raise
+        except (sqlite3.Error, KeyError) as e:
+            raise Unavailable("会话表读不出来：%s" % e) from e
         names = self.contacts()
         for it in rows:
             it["name"] = names.get(it["username"], it["username"])
@@ -904,7 +995,8 @@ class Reader:
                     "AND name LIKE 'Msg_%'")
                 for r in cur:
                     out.setdefault(r["name"], []).append(rel)
-            except (sqlite3.Error, Unavailable):
+            except (sqlite3.Error, Unavailable) as e:
+                self.shard_errors[rel] = "%s: %s" % (type(e).__name__, e)
                 continue
         return out
 
@@ -930,11 +1022,65 @@ class Reader:
                     % (cols, table), (since_ts, limit))
                 for r in cur:
                     rows.append(dict(r))
-            except (sqlite3.Error, Unavailable):
+            except (sqlite3.Error, Unavailable) as e:
+                self.shard_errors[rel] = "%s: %s" % (type(e).__name__, e)
                 continue
         rows.sort(key=lambda r: (r.get("create_time") or 0,
-                                 r.get("sort_seq") or 0, r.get("local_id") or 0))
+                                 r.get("sort_seq") or 0,
+                                 r.get("local_id") or 0))
         return [self._row(username, r, names) for r in rows[-limit:]]
+
+    def messages_after(self, username, after, limit=200):
+        """按 (create_time, sort_seq, local_id) 严格大于 after 的顺序取一页。
+
+        跨分片合并后按同一顺序排序，只返回最小的 limit 条。调用方拿返回的最后
+        一条当游标接着读，积压多少都能读完（评审 B2：以前只取最后 20 条，
+        中间那段被锚点直接跳过，永久丢）。
+        """
+        table = "Msg_" + hashlib.md5(username.encode("utf-8")).hexdigest()
+        shards = self._msg_tables().get(table)
+        if not shards:
+            return []
+        names = self._sender_names()
+        ats = int(after[0] or 0)
+        aseq = after[1]
+        alid = int(after[2] or 0)
+        cols = ("local_id, local_type, real_sender_id, create_time, "
+                "message_content, sort_seq")
+        if aseq is None:
+            # 老锚点没有 sort_seq：只能按 (时间, local_id) 比较，否则锚点那一行
+            # 会因为它自己的 sort_seq 更大而被重复读出来
+            where = ("WHERE create_time > ? "
+                     "   OR (create_time = ? AND local_id > ?) ")
+            args = (ats, ats, alid)
+        else:
+            aseq = int(aseq or 0)
+            where = ("WHERE create_time > ? "
+                     "   OR (create_time = ? AND sort_seq > ?) "
+                     "   OR (create_time = ? AND sort_seq = ? AND local_id > ?) ")
+            args = (ats, ats, aseq, ats, aseq, alid)
+        rows = []
+        for rel in shards:
+            try:
+                cur = self.conn(rel).execute(
+                    "SELECT %s FROM %s %s"
+                    "ORDER BY create_time ASC, sort_seq ASC, local_id ASC LIMIT ?"
+                    % (cols, table, where), args + (limit,))
+                for r in cur:
+                    rows.append(dict(r))
+            except (sqlite3.Error, Unavailable) as e:
+                self.shard_errors[rel] = "%s: %s" % (type(e).__name__, e)
+                continue
+        rows.sort(key=lambda r: (r.get("create_time") or 0,
+                                 r.get("sort_seq") or 0,
+                                 r.get("local_id") or 0))
+        return [self._row(username, r, names) for r in rows[:limit]]
+
+    def shard_failures(self, username):
+        """该会话所在分片这一轮读失败的清单（非空就别推进锚点）。"""
+        table = "Msg_" + hashlib.md5(username.encode("utf-8")).hexdigest()
+        return [r for r in self._msg_tables().get(table, [])
+                if r in self.shard_errors]
 
     def _row(self, username, r, names):
         text, kind = _content_text(r.get("message_content"), r.get("local_type"))
@@ -949,6 +1095,7 @@ class Reader:
         ts = int(r.get("create_time") or 0)
         return {"session": username, "sender": sender, "text": text,
                 "kind": kind, "local_id": r.get("local_id"),
+                "sort_seq": r.get("sort_seq") or 0,
                 "sender_id": sid, "sender_user": user,
                 "ts_unix": ts,
                 "ts_utc": datetime.fromtimestamp(ts, timezone.utc)
@@ -1118,26 +1265,49 @@ def collect(store_dir, limit_per_session=20, sessions=8, include_history_min=0,
                     if latest:
                         anchors[user] = {"ts": latest[-1]["ts_unix"],
                                          "local_id": latest[-1]["local_id"],
+                                         "sort_seq": latest[-1].get("sort_seq") or 0,
                                          "name": it.get("name") or user,
                                          "at": now}
                         if include_history_min:
                             rows.extend(latest)
                     continue
-                got = reader.messages(user, limit=limit_per_session, since_ts=a["ts"])
-                for m in got:
-                    if m["local_id"] == a.get("local_id") and m["ts_unix"] == a.get("ts"):
-                        continue
-                    rows.append(m)
+                # 从锚点之后一页页读，直到追平。以前只取「最后 20 条」，积压超过
+                # 20 条时中间那段会被新锚点直接跳过，永久丢（评审 B2）。
+                cursor = (a["ts"], a.get("sort_seq"), a.get("local_id") or 0)
+                got, cap = [], limit_per_session * 25
+                while True:
+                    page = reader.messages_after(user, cursor, limit=limit_per_session)
+                    if not page:
+                        break
+                    got.extend(page)
+                    last = page[-1]
+                    cursor = (last["ts_unix"], last.get("sort_seq") or 0,
+                              last.get("local_id") or 0)
+                    if len(page) < limit_per_session or len(got) >= cap:
+                        break
                 if got:
-                    anchors[user] = {"ts": got[-1]["ts_unix"], "local_id": got[-1]["local_id"],
-                                     "name": it.get("name") or user, "at": now}
+                    rows.extend(got)
+                    failed = reader.shard_failures(user)
+                    if failed:
+                        # 有分片没读成功：锚点这轮不能动，不然漏掉的那段再也回不来
+                        log("  %s 有分片读失败（%s），锚点本轮不推进"
+                            % (user, ", ".join(failed)))
+                    else:
+                        anchors[user] = {"ts": got[-1]["ts_unix"],
+                                         "local_id": got[-1]["local_id"],
+                                         "sort_seq": got[-1].get("sort_seq") or 0,
+                                         "name": it.get("name") or user, "at": now}
             if rows:
                 fresh = [m["session"] for m in rows]
             save_anchors(store_dir, anchors)
             _mark_pass(store_dir)
             info = {"account": reader.wxid, "sessions": len(sessions_now),
                     "new": len(rows), "sessions_with_new": sorted(set(fresh)),
-                    "aes": wxaes.status()["backend"], "keys": len(reader.keys)}
+                    "aes": wxaes.status()["backend"], "keys": len(reader.keys),
+                    # 缺钥匙/分片读失败都要浮到 info 上：否则「采不到」会被当成
+                    # 「没新消息」，面板和日志都看不见（评审 B17 / B18）
+                    "keys_missing": list(reader.missing_keys),
+                    "shards_failed": sorted(reader.shard_errors)}
             return rows, info
         finally:
             reader.close()
@@ -1183,15 +1353,19 @@ def dbcheck():
             # 无锁就会并发解密同一 dst、互踩同一批固定名 .part —— 等于把 R2-2/R2-3
             # 修掉的竞争原样带回来。锁拿不到让该项报错，不静默降级。
             with storelock.StoreLock(cache_dir):
-                r = Reader(acc, cache_dir)
-                item["keys"] = len(r.keys)
-                item["sessions"] = len(r.session_list(limit=5))
+                try:
+                    r = Reader(acc, cache_dir)
+                    item["keys"] = len(r.keys)
+                    item["sessions"] = len(r.session_list(limit=5))
+                    item["keys_missing"] = list(r.missing_keys)
+                finally:
+                    # 关连接 + 删明文副本必须在锁内做：锁外删会把别的进程
+                    # 正在用的 dst/.part 一并抹掉（评审 B-1193）
+                    if r is not None:
+                        r.close(purge=True)
             item["ok"] = item["keys"] > 0
         except Unavailable as e:
             item["ok"] = False
             item["error"] = str(e)
-        finally:
-            if r is not None:
-                r.close()
         rep["accounts"].append(item)
     return rep
