@@ -316,8 +316,9 @@ def test_wal_mechanics(tmp):
         with open(path, "wb") as f:
             # WAL 头 32 字节：magic(4) + 版本(4) + 页大小(4) + checkpoint 序号(4)
             #                + salt1(4) + salt2(4) + 校验1(4) + 校验2(4)
+            # 头里的整数一律大端（SQLite 规范）；帧头也是大端。
             f.write(b"\x37\x7f\x06\x82" +
-                    struct.pack("<III", 3007000, wxdb.PAGE_SZ, 1) +
+                    struct.pack(">III", 3007000, wxdb.PAGE_SZ, 1) +
                     h_salt + b"\x00" * 8)
             f.write(struct.pack(">II", 2, 2) + frame_salt + b"\x00" * 8)
             f.write(new_page2)

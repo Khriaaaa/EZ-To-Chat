@@ -277,6 +277,13 @@ def _pick():
                  "bcrypt": _bcrypt_cbc_decrypt}
         if force not in table:
             raise ValueError("WXREPLY_AES_BACKEND 只能是 pure/openssl/bcrypt")
+        # 强制指定就得真去加载那个库：以前只在 auto 分支里加载，强制 openssl/
+        # bcrypt 时 _OSSL/_BCRYPT 一直是 None，必然"不可用"→ 静默退回纯 Python，
+        # 设了等于没设（评审 B5）。
+        if force == "openssl":
+            _OSSL = _load_openssl()
+        elif force == "bcrypt":
+            _BCRYPT = _load_bcrypt()
         cands = [(force, table[force])]
     else:
         if os.name == "nt":
@@ -302,6 +309,10 @@ def _pick():
         why.append("%s 自检失败(%s)" % (name, msg))
         if name == "pure":
             raise RuntimeError("AES 纯 Python 参考实现自检都没过，代码有问题")
+    if force and force != "auto":
+        # 设了强制后端却用不上：宁可报错，也不许悄悄退回纯 Python
+        raise RuntimeError("WXREPLY_AES_BACKEND=%s 不可用：%s"
+                           % (force, "; ".join(why) or "原因不明"))
     _backend, _backend_name = _pure_cbc_decrypt, "pure"
     _backend_why = "; ".join(why)
     return _backend

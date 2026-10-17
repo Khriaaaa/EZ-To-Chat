@@ -476,7 +476,10 @@ def classify(img, item, origin, bounds):
     """
     import numpy as np
     H, W = img.shape[:2]
-    y0 = max(0, item["y"] - origin[1]); y1 = min(H, y0 + item["h"])
+    y0r = item["y"] - origin[1]
+    y1r = y0r + item["h"]
+    y0 = max(0, y0r)
+    y1 = min(H, y1r)          # 用未截断的底边算，否则滚出顶部的消息条带会偏（评审 B15）
     xa = max(0, bounds[0] - origin[0] + AVATAR_MARGIN)
     xb = min(W, bounds[1] - origin[0] - AVATAR_MARGIN)
     if y1 - y0 < 4 or xb - xa < 30:
@@ -504,8 +507,15 @@ def classify(img, item, origin, bounds):
 
 
 def fingerprint(session, text, occ):
-    """消息身份。故意不含 sender：同一条消息重看一遍时，发送方从 unknown 被改判，
-    如果 sender 参与哈希就会算成新的一行，实测同一句话会重复入库两遍。"""
+    """界面树路线的消息身份（occ = 本轮第几次出现）。
+
+    故意不含 sender：同一条消息重看一遍时，发送方从 unknown 被改判，
+    如果 sender 参与哈希就会算成新的一行，实测同一句话会重复入库两遍。
+
+    注意：db 直读路线**不用**这个函数，它用 (会话, local_id) 做身份 ——
+    occ 只在本轮内计数，跨轮同一句话会被误判成已存在（评审 B1）。两条路的
+    身份口径不可互换。
+    """
     raw = "\x1f".join([session, text, str(occ)])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -588,14 +598,28 @@ def session_list_rows(sessions, open_session, rows, seen, now=None):
         s, pv = it["session"], it["preview"]
         if not pv or s == open_session or it["selected"]:
             continue
+        # 会话列表里自己发的最后一条带「我: 」前缀。不带这个判据的话，未打开会话
+        # 里我自己说的话会被当成对方新消息，watch 会生成一条自问自答的回复（评审 B20）。
+        sender = "them"
+        for prefix in ("我：", "我:"):
+            if pv.startswith(prefix):
+                pv = pv[len(prefix):].strip()
+                sender = "me"
+                break
+        if not pv:
+            continue
         if any(r.get("text") == pv for r in rows
                if isinstance(r, dict) and r.get("session") == s):
             continue
-        fp = hashlib.sha1("\x1f".join(["slist", s, pv, it["time_hint"]]).encode("utf-8")).hexdigest()
+        # 指纹里加一个「当天」桶：会话列表的 time_hint 常为空或只到「昨天」，
+        # 同一句预览会被永久去重，那些会话再也进不来（评审 B21）。跨天的重复
+        # 能放进来，同一天内的重复仍按原逻辑挡住。
+        fp = hashlib.sha1("\x1f".join(["slist", s, pv, it["time_hint"],
+                                       time.strftime("%Y-%m-%d")]).encode("utf-8")).hexdigest()
         if fp in seen:
             continue
-        seen[fp] = (len(rows) + len(out), "them")
-        out.append({"ts_utc": now, "session": s, "sender": "them", "text": pv,
+        seen[fp] = (len(rows) + len(out), sender)
+        out.append({"ts_utc": now, "session": s, "sender": sender, "text": pv,
                     "align_left_px": 0, "align_right_px": 0,
                     "selector": "session_item_" + s, "time_hint": it["time_hint"],
                     "fp": fp, "src": "session_list"})
@@ -888,11 +912,12 @@ def parse_and_store(chat, sessions, shot_p, window, title_obj=None):
                 sender, lpx, rpx = classify(img, it, origin, bounds)
             else:
                 sender, lpx, rpx = "unknown", 0, 0
-            if sender == "unknown" and not (lpx or rpx):
-                continue                             # 这一轮截图没量到任何东西（窗口被盖/抓图失败），别存废行
+            # 引用关系是 UIA 直读文字，比像素可靠：先算出来，再决定要不要丢这一行
             quoted = qmap.get(it["text"]) or qmap.get(it["text"].strip())
+            if sender == "unknown" and not (lpx or rpx) and not quoted:
+                continue                             # 这一轮截图没量到任何东西（窗口被盖/抓图失败）
             if quoted:
-                sender = quoted                      # 引用关系是 UIA 直读文字，压过像素判断
+                sender = quoted                      # 压过像素判断
             occ = snap.get(it["text"], 0) + 1        # 本轮第几次出现，只用于生成指纹
             snap[it["text"]] = occ
             if mi < start:
@@ -962,6 +987,16 @@ def poll_db(mode, quiet):
             return 1
         log("%s，这轮回落界面树读取" % note)
         return None
+    except Exception as e:                                  # noqa: BLE001
+        # 锁超时（RuntimeError）、IO/sqlite 错误、缺库位：这一轮算失败，但必须
+        # 回落界面树。以前只捕 Unavailable，别的异常会把整轮采集直接炸掉（评审 B19）。
+        note = "本地库直读异常：%s: %s" % (type(e).__name__, e)
+        readmode.record(STORE_DIR, mode=mode, via="ui", note=note)
+        if mode == "db":
+            log(note)
+            return 1
+        log("%s，这轮回落界面树读取" % note)
+        return None
     blank = 0
     new = []
     with _StoreLock():
@@ -972,10 +1007,19 @@ def poll_db(mode, quiet):
             if not text:
                 blank += 1
                 continue
-            k = (m["session"], text)
-            occ = cnt.get(k, 0) + 1
-            cnt[k] = occ
-            fp = fingerprint(m["session"], text, occ)
+            # db 路用 (会话, local_id) 做身份：local_id 是库里的稳定主键。以前和
+            # 界面树共用「本轮第几次出现」的指纹，跨轮重复文本（「好」「嗯」）会
+            # 被当成已入库静默丢掉，永久补不回来（评审 B1）。没有 local_id 的
+            # 异常行才退回 occ 方案。
+            lid = m.get("local_id")
+            if lid:
+                fp = hashlib.sha1(("db\x1f%s\x1f%s" % (m["session"], lid))
+                                  .encode("utf-8")).hexdigest()
+            else:
+                k = (m["session"], text)
+                occ = cnt.get(k, 0) + 1
+                cnt[k] = occ
+                fp = fingerprint(m["session"], text, occ)
             if fp in seen:
                 continue
             seen[fp] = (len(old) + len(new), m["sender"])
