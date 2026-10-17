@@ -209,9 +209,10 @@ def load_messages(path=None):
 
 
 def build_transcript(msgs, session, limit):
-    sel = [m for m in msgs if m.get("session") == session][-limit:]
-    if not sel:
+    sess_msgs = [m for m in msgs if m.get("session") == session]
+    if not sess_msgs:
         die(f"会话 {session!r} 没有消息", code=EXIT_NO_MESSAGE)
+    sel = sess_msgs[-limit:]
     lines = []
     for m in sel:
         s = m.get("sender")
@@ -230,7 +231,10 @@ def build_transcript(msgs, session, limit):
     # 顺带把最后一条「对方」消息的指纹带出去：自检线程靠它判断「建议是不是已经
     # 跟上最新消息」。故意不看最后一条是不是我发的 —— 我方消息不该触发新一轮生成
     # （watch 侧同样只认 sender=="them"），否则我自己每发一条消息，自检就白烧一次模型。
-    last_fp = next((m.get("fp") for m in reversed(sel)
+    # 必须按整个会话算，不能只在截断后的窗口里找：最后 20 条全是我发的时候，
+    # 窗口里没有 them，last_fp 会变成 None，自检就永远判「没跟上」，每 30 秒
+    # 重新生成一次（评审 B6）。
+    last_fp = next((m.get("fp") for m in reversed(sess_msgs)
                     if m.get("sender") == "them" and m.get("fp")), None)
     return "\n".join(lines), len(sel), last_fp
 

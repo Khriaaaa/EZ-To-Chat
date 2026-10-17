@@ -58,6 +58,35 @@ def read_messages(path):
     return out
 
 
+# messages.jsonl 只追加，但 apply_sender_fixes 会「原地重写整文件」（行数不变、
+# 每行长度可能变）。所以游标只能用「非空行数」，不能用字节偏移。整文件读一次
+# 之后按 (size, mtime_ns) 缓存：没被改写就不重复读，也不重复解析（评审 B10）。
+_FILE_CACHE = {"sig": None, "lines": []}
+
+
+def read_lines(path):
+    """返回 (非空行列表, 签名)。签名不变就复用上一次的读结果。"""
+    try:
+        st = path.stat()
+    except OSError:
+        return [], None
+    sig = (st.st_size, st.st_mtime_ns)
+    if _FILE_CACHE["sig"] == sig:
+        return _FILE_CACHE["lines"], sig
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(line)
+    except OSError:
+        return [], sig
+    _FILE_CACHE["sig"] = sig
+    _FILE_CACHE["lines"] = out
+    return out, sig
+
+
 def fp_of(m):
     """消息身份：优先用采集层算好的 fp，老行（没 fp 字段）按内容算。
 
@@ -76,16 +105,28 @@ def fp_of(m):
     return "h-" + hashlib.sha1("\x1f".join(parts).encode("utf-8")).hexdigest()[:20]
 
 
-def new_incoming(store, seen):
-    """扫一遍消息库，返回 (新增的对方消息, {会话: 该会话新行的指纹}, 其它新行的指纹)。
+def new_incoming(store, seen, start=0):
+    """从第 start 个非空行往后扫，返回 (新对方消息, {会话: 指纹}, 其它新指纹, 总行数)。
 
     指纹按会话分开返回，是为了「生成失败时只撤回这一个会话」。老实现把整批指纹
     放在一个列表里，前面的会话生成成功就把列表清空了，后面的会话再失败时已经
     无指纹可撤 —— 它的消息被永久记成「已见」，不生成、不报错、面板也看不出来。
-    第三个返回值是不需要触发的行（我方消息、发送方未知），它们可以直接确认落盘。
+
+    start 是「已确认的行数」游标。以前靠一份上限 2000 条的指纹集合判新旧，库里
+    消息一多最老的指纹就被挤掉，重启后整段历史都被当成新消息，逐个会话调模型
+    （评审 B3：5000 条时一次重启触发 30 个会话）。行数游标不受总量影响。
     """
+    path = store / "messages.jsonl"
+    lines, _sig = read_lines(path)
+    if len(lines) < start:
+        # 文件被截断或换了一份：宁可这轮不触发，也绝不把整库当新消息
+        return [], {}, [], len(lines)
     fresh, by_sess, others = [], {}, []
-    for _idx, m in read_messages(store / "messages.jsonl"):
+    for line in lines[start:]:
+        try:
+            m = json.loads(line)
+        except json.JSONDecodeError:
+            continue
         key = fp_of(m)
         if key is None or key in seen:
             continue
@@ -95,7 +136,7 @@ def new_incoming(store, seen):
             by_sess.setdefault(m.get("session"), []).append(key)
         else:
             others.append(key)
-    return fresh, by_sess, others
+    return fresh, by_sess, others, len(lines)
 
 
 # generate.py 自己管一个总预算（WXREPLY_BUDGET，默认 150s，见那边的 BUDGET_SEC）；
@@ -132,30 +173,36 @@ def write_status(store, **kw):
     tmp.replace(path)
 
 
-def load_seen(store):
-    """已见指纹落盘，这样 watch 重启（或 --once 分次跑）不会把离线期间的消息漏掉。
-
-    返回 dict（Python 3.7+ 保持插入顺序）而不是 set：见 save_seen。
-    """
+def load_state(store):
+    """返回 (已确认的非空行数, 已确认指纹列表)；None = 没有可用状态。"""
     path = store / "watcher_seen.json"
-    if path.exists():
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("version") == 2:
         try:
-            return {k: None for k in json.loads(path.read_text(encoding="utf-8"))}
-        except Exception:
-            pass
+            return int(data.get("lines") or 0), list(data.get("done") or [])
+        except (TypeError, ValueError):
+            return None
+    # 旧格式（纯指纹数组）：没有行游标，按「首次」处理 —— 历史不触发
     return None
 
 
-def save_seen(store, seen, cap=2000):
-    """落盘已见指纹，只留最近 cap 条。
+def save_state(store, lines, done, cap=5000):
+    """落盘「已确认行数」游标 + 游标之后的已确认指纹。
 
-    seen 必须是有序的（dict / deque），否则 list(seen)[-cap:] 截掉的是随机项：
-    被截掉的老指纹下一轮会被当成新消息，重复触发一轮生成。以前这里踩过。
+    done 只装游标之后、还没推进的那一段；所有会话都生成完就清空，所以 cap
+    只是保险丝。真被截断也只是多生成一次，不会像旧实现那样把整段历史当成
+    新消息（评审 B3：上限 2000 条，5000 条库重启一次触发 30 个会话）。
     """
     path = store / "watcher_seen.json"
-    items = list(seen)[-cap:]
+    items = list(done)[-cap:]
+    payload = {"version": 2, "lines": int(lines), "done": items}
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -172,20 +219,21 @@ def main():
     store = Path(a.store)
     store.mkdir(parents=True, exist_ok=True)
 
-    seen = load_seen(store)
-    if seen is None:
-        # 首次跑（或状态文件读坏）：把已有消息全记成已见，历史的不会触发
-        seen = {}
-        for _idx, m in read_messages(store / "messages.jsonl"):
-            k = fp_of(m)
-            if k:
-                seen[k] = None
-        save_seen(store, seen)
+    state = load_state(store)
+    if state is None:
+        # 首次跑（或状态是旧格式）：把已有消息全记成已见，历史的不会触发
+        lines_all, _sig = read_lines(store / "messages.jsonl")
+        n_lines = len(lines_all)
+        done = {}
+        save_state(store, n_lines, done)
+    else:
+        n_lines, done_list = state
+        done = {k: None for k in done_list}
     # seen = 内存里「已扫过」的指纹；done = 已确认、可以落盘的指纹。
     # 两者分开是为了「待生成」的行不被提前写盘：只有生成成功、或本来就不需要
     # 触发的行（我方消息/未知发送方）才进 done。watch 若在待生成期间被杀，
     # 重启后这些行仍然是「没见过」，不会静默丢掉。
-    done = dict(seen)
+    seen = dict(done)
     if a.verbose:
         print(f"[watch] 起步已见 {len(seen)} 条", file=sys.stderr)
 
@@ -193,10 +241,11 @@ def main():
     pending_at = 0.0
     pending = {}                   # 会话 -> 该会话待生成行的指纹
     retry_at = 0.0
+    total = 0                      # 最近一次扫描看到的非空行数
 
     while True:
         if time.time() >= retry_at:
-            fresh, by_sess, others = new_incoming(store, seen)
+            fresh, by_sess, others, total = new_incoming(store, seen, n_lines)
             if others:
                 for k in others:                     # 我方消息 / 未知发送方：不触发，直接确认
                     done[k] = None
@@ -224,7 +273,12 @@ def main():
             if ok:
                 for k in pending.pop(sess, []):      # 只有成功才把这一批指纹落盘
                     done[k] = None
-                save_seen(store, done)
+                if not pending_sessions and total:
+                    # 所有会话都生成完了：游标推到文件尾，done/seen 清空
+                    n_lines = total
+                    done = {}
+                    seen = {}
+                save_state(store, n_lines, done)
             else:
                 # 失败：只撤回**这个会话**的指纹，别的会话不受影响（它们的指纹本来
                 # 就没进 done，下一轮照常生成）。撤回后这批消息下一轮还是「新消息」，

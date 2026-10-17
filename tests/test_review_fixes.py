@@ -204,13 +204,19 @@ finally:
 time.sleep(0.5)
 check('锁释放后回到正常路径', run_gen().returncode == 0)
 
-print('\n=== 6. watch 的 seen 必须有序（截断丢最旧，不是随机）===')
+print('\n=== 6. watch 状态：行游标不丢历史，旧格式按首次处理 ===')
 w = load(ROOT / 'orchestrator' / 'watch.py', 'watch_under_test')
-w.save_seen(ST, {f'k{i:05d}': None for i in range(2300)}, cap=2000)
+w.save_state(ST, 2300, [f'k{i:05d}' for i in range(2300)])
 saved = json.loads((ST / 'watcher_seen.json').read_text(encoding='utf-8'))
-check('只留 2000 条', len(saved) == 2000, str(len(saved)))
-check('丢的是最旧的 300 条', saved[0] == 'k00300' and saved[-1] == 'k02299', f'{saved[0]}..{saved[-1]}')
-check('读回来仍是有序 dict', list(w.load_seen(ST))[:2] == ['k00300', 'k00301'])
+check('v2 结构带行游标', saved.get('version') == 2 and saved.get('lines') == 2300,
+      str(saved.get('lines')))
+check('游标后的指纹不再截断到 2000', len(saved['done']) == 2300, str(len(saved['done'])))
+lines, done = w.load_state(ST)
+check('读回来游标与首尾一致',
+      lines == 2300 and done[0] == 'k00000' and done[-1] == 'k02299',
+      f'{lines}/{done[0]}..{done[-1]}')
+(ST / 'watcher_seen.json').write_text(json.dumps(['a', 'b']), encoding='utf-8')
+check('旧格式（纯数组）按首次跑处理，不拿它判历史', w.load_state(ST) is None)
 
 print('\n=== 7. read_jsonl 缓存 ===')
 srv = load(ROOT / 'web' / 'server.py', 'srv_under_test')
