@@ -58,6 +58,15 @@ def _run(args, timeout=90):
     return r.stdout
 
 
+def _sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 16), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
 def _parse_rect(text):
     for line in text.splitlines():
         parts = line.strip().split(",")
@@ -80,7 +89,23 @@ def fill(text, log=print):
     local.write_text(text, encoding="utf-8")
 
     _run([PY, str(GA), "put", str(local), GUEST_FILL])
-    log("已投放文本 %d 字" % len(text))
+    # 校验投放结果（评审 B11）：剪贴板真正读的是虚机里的 fill.txt，不是本地这份。
+    # 传坏了就重传一次，还不对宁可失败，也别把上一条旧文本粘进聊天框。
+    check = SCRATCH / "fill.check.txt"
+    want = _sha256(local)
+    for attempt in (1, 2):
+        try:
+            _run([PY, str(GA), "get", GUEST_FILL, str(check)])
+        except FillError:
+            if attempt == 2:
+                raise
+            continue
+        if _sha256(check) == want:
+            break
+        if attempt == 2:
+            raise FillError("投放内容校验失败（虚机里的 fill.txt 与本地不一致）")
+        _run([PY, str(GA), "put", str(local), GUEST_FILL])
+    log("已投放文本 %d 字（校验一致）" % len(text))
 
     # 结束上一次还在保活的实例，保证剪贴板归属唯一
     _run([PY, str(GA), "exec", "cmd.exe", "/c",
@@ -103,7 +128,13 @@ def fill(text, log=print):
     l, t, r, b = rect
     if r - l < 400 or b - t < 300 or t < -100:
         raise FillError("微信窗口矩形不合理 %s，可能最小化了" % rect)
-    cx, cy = (l + r) // 2, b - INPUT_ABOVE_BOTTOM
+    # 输入框贴窗口底边。90px 是 1024x768 实测值；窗口更矮（或换了 DPI/分辨率）时
+    # 按比例收，且必须落在窗口下半部 —— 否则一点就点进聊天记录或工具栏（评审 B11）。
+    h = b - t
+    off = INPUT_ABOVE_BOTTOM if h >= 600 else max(40, int(h * 0.14))
+    cx, cy = (l + r) // 2, b - off
+    if not (t + h * 0.5 < cy < b - 8):
+        raise FillError("算出的输入框位置 %d 不在窗口下半部 %s" % (cy, rect))
     log("微信窗口 %d,%d,%d,%d → 点输入框 %d,%d" % (l, t, r, b, cx, cy))
 
     _run([PY, str(VMCTL), "click", str(cx), str(cy)])
