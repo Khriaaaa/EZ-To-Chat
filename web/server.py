@@ -17,6 +17,7 @@ Key 存在 store/.llm.yaml（0600，只留在本机）里，接口只回显尾�
 除 /login 与 /api/health 外均需登录。
 """
 import argparse
+import calendar
 import hashlib
 import hmac
 import importlib.util
@@ -214,7 +215,7 @@ def check_round():
         write_check(last_check_utc=utcnow(), last_result="no_message", guest_running=guest_running, guest_started=guest_started,
                     error=None, msgs=len(msgs))
         return False
-    if last and last.get("source_last_fp") == fp:
+    if last and last.get("source_last_fp") and last.get("source_last_fp") == fp:
         write_check(last_check_utc=utcnow(), last_result="no_change", guest_running=guest_running, guest_started=guest_started,
                     error=None, msgs=len(msgs))
         return False
@@ -505,7 +506,7 @@ def link_test_state():
     """
     try:
         j = json.loads(LINK_FILE.read_text(encoding="utf-8"))
-        ts = time.mktime(time.strptime(j["ts"], "%Y-%m-%dT%H:%M:%SZ")) if "ts" in j else 0
+        ts = calendar.timegm(time.strptime(j["ts"], "%Y-%m-%dT%H:%M:%SZ")) if "ts" in j else 0
         if time.time() - ts > 86400:      # 超过一天的结果不 preset「链路 ✓」，太旧会骗人
             return {"state": "", "text": "未测"}
         return {"state": j.get("state") or "", "text": j.get("text") or ""}
